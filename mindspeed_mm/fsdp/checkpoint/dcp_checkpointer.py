@@ -148,6 +148,10 @@ class DistributedCheckpointer(CheckpointerBase):
         save_state = {"model": ModelState(state["model"])}
         if "optimizer" in state:
             save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        if "ema_model" in state:
+            # EMA is model-sized sharded state and must not be duplicated into
+            # each rank's small extra-state file.
+            save_state["ema_model"] = ModelState(state["ema_model"])
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
@@ -201,6 +205,8 @@ class DistributedCheckpointer(CheckpointerBase):
         load_state = {"model": ModelState(state["model"])}
         if not release and "optimizer" in state:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        if not release and "ema_model" in state:
+            load_state["ema_model"] = ModelState(state["ema_model"])
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)

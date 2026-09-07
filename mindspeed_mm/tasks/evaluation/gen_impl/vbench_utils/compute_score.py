@@ -122,3 +122,8 @@ def compute_score(result: dict):
     print(f'|    semantic score|{semantic_score}|')
     print(f'|       total score|{final_score}|')
     print('+------------------|------------------+')
+    return {
+        "quality_score": quality_score,
+        "semantic_score": semantic_score,
+        "total_score": final_score,
+    }
