@@ -74,6 +74,70 @@ class AscendVisionAttentionBackend:
         return output
 
 
+class AscendKVCacheAttentionBackend:
+    """Single-sample q_len != kv_len TND attention for diffusion KV reuse."""
+
+    def __init__(self, torch_npu_module: Any = None) -> None:
+        if torch_npu_module is None:
+            try:
+                import torch_npu as torch_npu_module
+            except ImportError as exc:
+                raise LanceAscendAttentionError("native Lance KV-cache attention requires torch_npu") from exc
+        self.torch_npu = torch_npu_module
+        self._causal_masks: Dict[str, torch.Tensor] = {}
+
+    def _causal_mask(self, query: torch.Tensor) -> torch.Tensor:
+        key = str(query.device)
+        mask = self._causal_masks.get(key)
+        if mask is None:
+            mask = query.new_ones((2048, 2048), dtype=torch.bool).triu(diagonal=1)
+            self._causal_masks[key] = mask
+        return mask
+
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise LanceAscendAttentionError("Ascend KV-cache attention requires TND tensors")
+        if (
+            key.shape != value.shape
+            or key.shape[-1] != query.shape[-1]
+            or key.shape[1] <= 0
+            or query.shape[1] % key.shape[1]
+        ):
+            raise LanceAscendAttentionError("invalid KV-cache attention tensor shapes")
+        if key.shape[0] < query.shape[0]:
+            raise LanceAscendAttentionError("KV-cache key length must be >= query length")
+        output = self.torch_npu.npu_fusion_attention(
+            query,
+            key,
+            value,
+            head_num=query.shape[1],
+            input_layout="TND",
+            pse=None,
+            padding_mask=None,
+            atten_mask=self._causal_mask(query) if is_causal else None,
+            scale=1.0 / math.sqrt(query.shape[-1]),
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            actual_seq_qlen=(query.shape[0],),
+            actual_seq_kvlen=(key.shape[0],),
+            sparse_mode=3 if is_causal else 0,
+        )[0]
+        if output.shape != query.shape:
+            raise LanceAscendAttentionError(
+                "NPU KV-cache attention returned {}, expected {}".format(
+                    tuple(output.shape), tuple(query.shape)
+                )
+            )
+        return output
+
+
 class AscendBlockAttentionBackend:
     """Callable attention backend matching ``modeling_lance.AttentionBackend``."""
 

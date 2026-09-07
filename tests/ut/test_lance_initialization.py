@@ -7,9 +7,11 @@ os.environ.setdefault("NON_MEGATRON", "true")
 torch = pytest.importorskip("torch")
 
 from mindspeed_mm.models.omni.lance.initialization import (
+    LanceInitializationError,
     copy_understanding_to_generation,
     initialize_from_qwen_vl_state_dict,
     initialize_random,
+    load_native_lance_checkpoint,
     qwen_vl_target_name,
 )
 from mindspeed_mm.models.omni.lance.modeling_lance import LanceNativeModel
@@ -83,3 +85,41 @@ def test_strict_random_mode_is_seeded_and_does_not_copy_experts():
         first.language_model.model.layers[0].self_attn.q_proj_moe_gen.weight,
     )
 
+
+def test_native_checkpoint_streaming_load_round_trips_every_parameter(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    torch.manual_seed(61)
+    source = LanceNativeModel(_config(), dtype=torch.bfloat16)
+    expected = {
+        name: value.detach().cpu().contiguous().clone()
+        for name, value in source.state_dict().items()
+    }
+    checkpoint = tmp_path / "model.safetensors"
+    safetensors.save_file(expected, str(checkpoint))
+    target = LanceNativeModel(_config(), dtype=torch.bfloat16)
+    with torch.no_grad():
+        for parameter in target.parameters():
+            parameter.zero_()
+    report = load_native_lance_checkpoint(target, checkpoint, fingerprint=True)
+    assert report["status"] == "loaded"
+    assert report["streaming"] is True
+    assert report["tensor_count"] == len(expected)
+    assert len(report["sha256"]) == 64
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, expected[name])
+
+
+def test_native_checkpoint_loader_refuses_meta_destination(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    source = LanceNativeModel(_config(), dtype=torch.bfloat16)
+    checkpoint = tmp_path / "model.safetensors"
+    safetensors.save_file(
+        {
+            name: value.detach().cpu().contiguous()
+            for name, value in source.state_dict().items()
+        },
+        str(checkpoint),
+    )
+    target = LanceNativeModel(_config(), device="meta", dtype=torch.bfloat16)
+    with pytest.raises(LanceInitializationError, match="materialized"):
+        load_native_lance_checkpoint(target, checkpoint)

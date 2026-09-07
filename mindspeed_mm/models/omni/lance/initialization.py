@@ -1,14 +1,73 @@
-"""Initialization policies for native Lance training."""
+"""Initialization and release-checkpoint loading for native Lance."""
 
-from typing import Any, Dict, Mapping
+from pathlib import Path
+from typing import Any, Dict, Mapping, Union
 
 import torch
 
 from .modeling_lance import LanceNativeModel
+from .checkpoint import audit_checkpoint_metadata, read_safetensors_header, sha256_file
 
 
 class LanceInitializationError(ValueError):
     pass
+
+
+def load_native_lance_checkpoint(
+    model: LanceNativeModel,
+    checkpoint: Union[str, Path],
+    *,
+    fingerprint: bool = False,
+) -> Dict[str, Any]:
+    """Stream an official safetensors checkpoint into an allocated model.
+
+    Only one source tensor is materialized on CPU at a time.  A complete
+    payload/name/shape/BF16 audit runs before the first parameter is mutated.
+    """
+
+    path = Path(checkpoint).expanduser().resolve()
+    if path.is_dir():
+        path = path / "model.safetensors"
+    header = read_safetensors_header(path)
+    audit = audit_checkpoint_metadata(header, model.config)
+    if not audit["valid"]:
+        raise LanceInitializationError(
+            "checkpoint failed the native Lance {} contract".format(model.config.variant)
+        )
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:
+        raise LanceInitializationError("native checkpoint loading requires safetensors") from exc
+
+    targets = dict(model.named_parameters())
+    expected_names = set(header.tensors)
+    if set(targets) != expected_names:
+        raise LanceInitializationError("allocated model parameter tree does not match the checkpoint")
+    if any(parameter.is_meta for parameter in targets.values()):
+        raise LanceInitializationError("streaming load requires materialized model parameters")
+
+    loaded_bytes = 0
+    with torch.no_grad(), safe_open(str(path), framework="pt", device="cpu") as source:
+        if set(source.keys()) != expected_names:
+            raise LanceInitializationError("safetensors keys changed after header audit")
+        for name in sorted(expected_names):
+            value = source.get_tensor(name)
+            target = targets[name]
+            if value.shape != target.shape or value.dtype != torch.bfloat16:
+                raise LanceInitializationError("checkpoint tensor changed after header audit: {}".format(name))
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+            loaded_bytes += value.numel() * value.element_size()
+            del value
+    return {
+        "status": "loaded",
+        "variant": model.config.variant,
+        "checkpoint": str(path),
+        "sha256": sha256_file(path) if fingerprint else None,
+        "tensor_count": len(expected_names),
+        "tensor_bytes": loaded_bytes,
+        "streaming": True,
+        "audit": audit,
+    }
 
 
 def copy_understanding_to_generation(model: LanceNativeModel) -> Dict[str, Any]:
@@ -116,4 +175,3 @@ def initialize_random(model: LanceNativeModel, seed: int) -> Dict[str, Any]:
         "generation_expert_copied": False,
         "note": "Frozen ViT/VAE initialization is external and not randomized by this function.",
     }
-

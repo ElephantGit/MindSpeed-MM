@@ -1,7 +1,7 @@
 # Lance 适配验证记录
 
 本记录区分三类结果：已在当前工作区实际执行、只验证元数据，以及必须在 Ascend 节点执行。
-记录日期为 2026-09-06。
+记录日期为 2026-09-07。
 
 ## 已实际执行并通过
 
@@ -58,6 +58,11 @@ CPU PyTorch 2.2.2 和 safetensors 0.4.5，并由 Python 3.10.18 临时加入 imp
 - joint CE/flow-matching step、Qwen 初始化映射、generation expert copy；
 - 3D sin/cos 位置表与官方 NumPy 公式数值对齐；
 - Euler timestep/方向、文本+视觉 CFG、renorm、edit 子集更新和原生 tiny-model 采样。
+- Qwen2.5-VL ViT window/full schedule、visual RoPE、merger reorder 和 window 隔离；
+- full/causal 原生 KV-cache 与完整序列逐层等价，缓存版 Euler latent 与完整重算一致；
+- 官方 PackedDataset 的 mixed-expert segment、online/offline VAE/ViT 和 joint backward；
+- 逐 tensor BF16 safetensors streaming load 的完整参数往返；
+- decoder activation checkpointing 开关前后的输出、输入梯度和参数梯度一致。
 
 这些是 CPU 上的结构、梯度和算法语义验证，不能替代目标 PyTorch 2.7.1、torch-npu、CANN 与
 Ascend 芯片上的数值和性能验收。
@@ -85,7 +90,7 @@ python inference_lance.py --runtime-check
 ## 最新验证
 
 ```text
-73 passed (temporary CPU torch validation runtime)
+115 passed (temporary CPU torch validation runtime)
 Python compilation: passed
 CLI help/preflight: passed
 git diff --check: passed

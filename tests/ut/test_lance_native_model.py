@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 
 import pytest
 
@@ -176,3 +177,47 @@ def test_native_model_rebuilds_frozen_latent_position_table():
     )
     assert model.latent_pos_embed.pos_embed.requires_grad is False
     torch.testing.assert_close(model.latent_pos_embed.pos_embed, expected)
+
+
+def test_gradient_checkpointing_preserves_forward_and_backward():
+    torch.manual_seed(67)
+    baseline = LanceNativeModel(_tiny_config()).train()
+    checkpointed = deepcopy(baseline).train()
+    checkpointed.set_gradient_checkpointing(True)
+    length = 6
+    position_ids = torch.arange(length).repeat(3, 1)
+    attention_mask = torch.ones(length, length, dtype=torch.bool).tril()
+    understanding = torch.tensor([0, 1, 2])
+    generation = torch.tensor([3, 4, 5])
+    baseline_input = torch.randn(length, baseline.config.hidden_size, requires_grad=True)
+    checkpointed_input = baseline_input.detach().clone().requires_grad_(True)
+    baseline_output = baseline.forward_language(
+        baseline_input,
+        position_ids,
+        attention_mask,
+        understanding,
+        generation,
+    )
+    checkpointed_output = checkpointed.forward_language(
+        checkpointed_input,
+        position_ids,
+        attention_mask,
+        understanding,
+        generation,
+    )
+    target = torch.randn_like(baseline_output)
+    (baseline_output * target).sum().backward()
+    (checkpointed_output * target).sum().backward()
+    torch.testing.assert_close(checkpointed_output, baseline_output, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(checkpointed_input.grad, baseline_input.grad, rtol=1e-5, atol=1e-6)
+    for (baseline_name, baseline_parameter), (actual_name, actual_parameter) in zip(
+        baseline.named_parameters(), checkpointed.named_parameters()
+    ):
+        assert baseline_name == actual_name
+        if baseline_parameter.grad is not None:
+            torch.testing.assert_close(
+                actual_parameter.grad,
+                baseline_parameter.grad,
+                rtol=1e-5,
+                atol=1e-6,
+            )

@@ -37,6 +37,14 @@ def get_native_sampler():
     return sample_native_lance
 
 
+def get_native_cached_sampler():
+    """Load the KV-cached native sampler without eager torch imports."""
+
+    from .sampling import sample_native_lance_cached
+
+    return sample_native_lance_cached
+
+
 def get_preencoded_collator():
     """Load the torch-dependent prepared-sample collator lazily."""
 
@@ -51,6 +59,14 @@ def get_training_state_class():
     from .training_state import LanceTrainingState
 
     return LanceTrainingState
+
+
+def get_native_checkpoint_loader():
+    """Load the strict streaming safetensors loader lazily."""
+
+    from .initialization import load_native_lance_checkpoint
+
+    return load_native_lance_checkpoint
 
 __all__ = [
     "LanceCheckpointError",
@@ -75,6 +91,8 @@ __all__ = [
     "expected_state_shapes",
     "read_safetensors_header",
     "get_native_model_class",
+    "get_native_cached_sampler",
+    "get_native_checkpoint_loader",
     "get_native_sampler",
     "get_preencoded_collator",
     "get_training_state_class",

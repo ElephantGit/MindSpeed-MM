@@ -8,12 +8,18 @@ torch = pytest.importorskip("torch")
 
 from mindspeed_mm.models.omni.lance.modeling_lance import LanceNativeModel
 from mindspeed_mm.models.omni.lance.native_config import LanceNativeConfig
+from mindspeed_mm.models.omni.lance.sequence import LanceDocument, LancePackedSequence, LanceSegment
 from mindspeed_mm.models.omni.lance.sampling import (
     LanceDenoiseContext,
+    LanceSamplingError,
+    compile_native_kv_cache,
     euler_flow_sample,
     lance_cfg_velocity,
     lance_sampling_schedule,
+    predict_cached_native_velocity,
+    predict_native_velocity,
     sample_native_lance,
+    sample_native_lance_cached,
 )
 
 
@@ -147,3 +153,88 @@ def test_tiny_native_model_runs_deterministic_end_to_end_sampling():
     assert first.shape == initial.shape
     assert not torch.equal(first, initial)
     torch.testing.assert_close(first, second)
+
+
+def _cacheable_context():
+    mask = torch.tensor(
+        [
+            [True, False, False, False],
+            [True, True, False, False],
+            [True, True, True, True],
+            [True, True, True, True],
+        ]
+    )
+    return LanceDenoiseContext(
+        token_ids=torch.tensor([1, 2, 0, 0]),
+        text_indexes=torch.tensor([0, 1]),
+        position_ids=torch.arange(4).repeat(3, 1),
+        attention_mask=mask,
+        understanding_indexes=torch.tensor([0, 1]),
+        generation_indexes=torch.tensor([2, 3]),
+        vae_indexes=torch.tensor([2, 3]),
+        latent_position_ids=torch.tensor([0, 1]),
+        prediction_indexes=torch.tensor([2, 3]),
+        prediction_latent_indexes=torch.tensor([0, 1]),
+    )
+
+
+def test_cached_velocity_and_sampler_match_full_recompute():
+    torch.manual_seed(23)
+    model = LanceNativeModel(_tiny_config()).eval()
+    context = _cacheable_context()
+    initial = torch.randn(2, model.config.patch_latent_dim)
+    timestep = torch.tensor(0.6)
+    with torch.no_grad():
+        state = compile_native_kv_cache(model, context, initial)
+        cached_velocity = predict_cached_native_velocity(model, state, initial, timestep)
+        full_velocity = predict_native_velocity(model, context, initial, timestep)
+        cached_sample = sample_native_lance_cached(
+            model,
+            context,
+            initial,
+            num_steps=3,
+            timestep_shift=3.0,
+        )
+        full_sample = sample_native_lance(
+            model,
+            context,
+            initial,
+            num_steps=3,
+            timestep_shift=3.0,
+        )
+    torch.testing.assert_close(cached_velocity, full_velocity, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(cached_sample, full_sample, rtol=1e-5, atol=1e-6)
+
+
+def test_cache_compiler_refuses_non_suffix_prediction_layout():
+    model = LanceNativeModel(_tiny_config()).eval()
+    context = _cacheable_context()
+    context.prediction_indexes = torch.tensor([1, 3])
+    with pytest.raises(LanceSamplingError, match="suffix"):
+        compile_native_kv_cache(
+            model,
+            context,
+            torch.randn(2, model.config.patch_latent_dim),
+        )
+
+
+def test_cache_compiler_refuses_condition_noise_that_query_must_not_see():
+    model = LanceNativeModel(_tiny_config()).eval()
+    context = _cacheable_context()
+    context.attention_mask = LancePackedSequence(
+        (
+            LanceDocument(
+                "unsafe-cache",
+                (
+                    LanceSegment(2, "noise", "text", "understanding"),
+                    LanceSegment(2, "noise", "vae", "generation"),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(LanceSamplingError, match="condition cannot include noise"):
+        compile_native_kv_cache(
+            model,
+            context,
+            torch.randn(2, model.config.patch_latent_dim),
+        )

@@ -10,11 +10,13 @@ The architecture follows the Apache-2.0 licensed Lance and Qwen2.5-VL releases.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .native_config import LanceNativeConfig
 
@@ -23,6 +25,27 @@ AttentionBackend = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     torch.Tensor,
 ]
+
+KVAttentionBackend = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, bool],
+    torch.Tensor,
+]
+
+
+@dataclass(frozen=True)
+class LanceLayerKVCache:
+    """Post-RoPE key/value tensors for one decoder layer."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
+class LanceKVCache:
+    """Static condition cache consumed by every diffusion denoising step."""
+
+    layers: Tuple[LanceLayerKVCache, ...]
+    condition_length: int
 
 
 class LanceRMSNorm(nn.Module):
@@ -141,6 +164,31 @@ def reference_sdpa(
     return output.squeeze(0).transpose(0, 1)
 
 
+def reference_kv_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Reference q_len != kv_len attention with bottom-right causality."""
+
+    query_length, key_length = query.shape[0], key.shape[0]
+    if key_length < query_length:
+        raise ValueError("KV-cache attention requires key length >= query length")
+    if is_causal:
+        row = torch.arange(query_length, device=query.device).unsqueeze(1)
+        column = torch.arange(key_length, device=query.device).unsqueeze(0)
+        attention_mask = column <= row + (key_length - query_length)
+    else:
+        attention_mask = torch.ones(
+            query_length,
+            key_length,
+            dtype=torch.bool,
+            device=query.device,
+        )
+    return reference_sdpa(query, key, value, attention_mask)
+
+
 def _validate_routes(length: int, understanding: torch.Tensor, generation: torch.Tensor) -> None:
     if understanding.ndim != 1 or generation.ndim != 1:
         raise ValueError("expert indexes must be one-dimensional")
@@ -218,15 +266,14 @@ class LanceMoTAttention(nn.Module):
             output[generation_indexes] = generation_norm(hidden_states[generation_indexes])
         return output
 
-    def forward(
+    def project_qkv(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         rotary_embedding: LanceMultimodalRotaryEmbedding,
         understanding_indexes: torch.Tensor,
         generation_indexes: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         _validate_routes(hidden_states.shape[0], understanding_indexes, generation_indexes)
         query = self._route_projection(
             hidden_states,
@@ -268,7 +315,15 @@ class LanceMoTAttention(nn.Module):
             self.k_norm_moe_gen,
         )
         query, key = rotary_embedding.apply(query, key, *position_embeddings)
-        attended = self.attention_backend(query, key, value, attention_mask).reshape(-1, self.hidden_size)
+        return query, key, value
+
+    def project_output(
+        self,
+        attended: torch.Tensor,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        attended = attended.reshape(-1, self.hidden_size)
         return self._route_projection(
             attended,
             understanding_indexes,
@@ -277,6 +332,68 @@ class LanceMoTAttention(nn.Module):
             self.o_proj_moe_gen,
             self.hidden_size,
         )
+
+    def forward_and_cache(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, LanceLayerKVCache]:
+        query, key, value = self.project_qkv(
+            hidden_states,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+        )
+        attended = self.attention_backend(query, key, value, attention_mask)
+        output = self.project_output(attended, understanding_indexes, generation_indexes)
+        return output, LanceLayerKVCache(key=key, value=value)
+
+    def forward_with_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        layer_cache: LanceLayerKVCache,
+        attention_backend: KVAttentionBackend,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        query, key, value = self.project_qkv(
+            hidden_states,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+        )
+        merged_key = torch.cat((layer_cache.key, key), dim=0)
+        merged_value = torch.cat((layer_cache.value, value), dim=0)
+        attended = attention_backend(query, merged_key, merged_value, is_causal)
+        return self.project_output(attended, understanding_indexes, generation_indexes)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        output, _ = self.forward_and_cache(
+            hidden_states,
+            attention_mask,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+        )
+        return output
 
 
 class LanceMoTDecoderLayer(nn.Module):
@@ -358,13 +475,97 @@ class LanceMoTDecoderLayer(nn.Module):
         )
         return hidden_states + feed_forward
 
+    def forward_and_cache(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, LanceLayerKVCache]:
+        normalized = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.input_layernorm,
+            self.input_layernorm_moe_gen,
+        )
+        attention_output, layer_cache = self.self_attn.forward_and_cache(
+            normalized,
+            attention_mask,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+        )
+        hidden_states = hidden_states + attention_output
+        post_attention = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.post_attention_layernorm,
+            self.post_attention_layernorm_moe_gen,
+        )
+        feed_forward = self._route(
+            post_attention,
+            understanding_indexes,
+            generation_indexes,
+            self.mlp,
+            self.mlp_moe_gen,
+        )
+        return hidden_states + feed_forward, layer_cache
+
+    def forward_with_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        layer_cache: LanceLayerKVCache,
+        attention_backend: KVAttentionBackend,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        normalized = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.input_layernorm,
+            self.input_layernorm_moe_gen,
+        )
+        hidden_states = hidden_states + self.self_attn.forward_with_kv_cache(
+            normalized,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+            layer_cache,
+            attention_backend,
+            is_causal,
+        )
+        post_attention = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.post_attention_layernorm,
+            self.post_attention_layernorm_moe_gen,
+        )
+        feed_forward = self._route(
+            post_attention,
+            understanding_indexes,
+            generation_indexes,
+            self.mlp,
+            self.mlp_moe_gen,
+        )
+        return hidden_states + feed_forward
+
 
 class LanceDecoderModel(nn.Module):
     def __init__(
         self,
         config: LanceNativeConfig,
         attention_backend: AttentionBackend = reference_sdpa,
-        vision_attention_backend: VisionAttentionBackend = reference_vision_sdpa,
         device=None,
         dtype=None,
     ) -> None:
@@ -385,6 +586,10 @@ class LanceDecoderModel(nn.Module):
         self.norm = LanceRMSNorm(config.hidden_size, config.rms_norm_eps, **factory)
         self.norm_moe_gen = LanceRMSNorm(config.hidden_size, config.rms_norm_eps, **factory)
         self.rotary_emb = LanceMultimodalRotaryEmbedding(config, device=device)
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
 
     def forward(
         self,
@@ -397,13 +602,100 @@ class LanceDecoderModel(nn.Module):
         _validate_routes(hidden_states.shape[0], understanding_indexes, generation_indexes)
         position_embeddings = self.rotary_emb(position_ids, hidden_states.dtype)
         for layer in self.layers:
-            hidden_states = layer(
+            if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
+                def layer_forward(states, current_layer=layer):
+                    return current_layer(
+                        states,
+                        attention_mask,
+                        position_embeddings,
+                        self.rotary_emb,
+                        understanding_indexes,
+                        generation_indexes,
+                    )
+
+                hidden_states = checkpoint(layer_forward, hidden_states, use_reentrant=False)
+            else:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask,
+                    position_embeddings,
+                    self.rotary_emb,
+                    understanding_indexes,
+                    generation_indexes,
+                )
+        return LanceMoTDecoderLayer._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.norm,
+            self.norm_moe_gen,
+        )
+
+    def build_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, LanceKVCache]:
+        """Encode a static condition once and retain every layer's K/V."""
+
+        _validate_routes(hidden_states.shape[0], understanding_indexes, generation_indexes)
+        position_embeddings = self.rotary_emb(position_ids, hidden_states.dtype)
+        layer_caches = []
+        for layer in self.layers:
+            hidden_states, layer_cache = layer.forward_and_cache(
                 hidden_states,
                 attention_mask,
                 position_embeddings,
                 self.rotary_emb,
                 understanding_indexes,
                 generation_indexes,
+            )
+            layer_caches.append(layer_cache)
+        normalized = LanceMoTDecoderLayer._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.norm,
+            self.norm_moe_gen,
+        )
+        return normalized, LanceKVCache(tuple(layer_caches), hidden_states.shape[0])
+
+    def forward_with_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        kv_cache: LanceKVCache,
+        attention_backend: KVAttentionBackend = reference_kv_sdpa,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        """Decode dynamic query tokens against a static condition cache."""
+
+        _validate_routes(hidden_states.shape[0], understanding_indexes, generation_indexes)
+        if len(kv_cache.layers) != len(self.layers):
+            raise ValueError("KV-cache layer count does not match the decoder")
+        position_embeddings = self.rotary_emb(position_ids, hidden_states.dtype)
+        for layer, layer_cache in zip(self.layers, kv_cache.layers):
+            expected = (
+                kv_cache.condition_length,
+                layer.self_attn.num_key_value_heads,
+                layer.self_attn.head_dim,
+            )
+            if layer_cache.key.shape != expected or layer_cache.value.shape != expected:
+                raise ValueError("KV-cache tensor shape does not match the decoder")
+            hidden_states = layer.forward_with_kv_cache(
+                hidden_states,
+                position_embeddings,
+                self.rotary_emb,
+                understanding_indexes,
+                generation_indexes,
+                layer_cache,
+                attention_backend,
+                is_causal,
             )
         return LanceMoTDecoderLayer._route(
             hidden_states,
@@ -864,6 +1156,7 @@ class LanceNativeModel(nn.Module):
         self,
         config: LanceNativeConfig,
         attention_backend: AttentionBackend = reference_sdpa,
+        vision_attention_backend: VisionAttentionBackend = reference_vision_sdpa,
         device=None,
         dtype=None,
     ) -> None:
@@ -913,6 +1206,45 @@ class LanceNativeModel(nn.Module):
             attention_mask,
             understanding_indexes,
             generation_indexes,
+        )
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.language_model.model.set_gradient_checkpointing(enabled)
+
+    def build_language_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, LanceKVCache]:
+        return self.language_model.model.build_kv_cache(
+            hidden_states,
+            position_ids,
+            attention_mask,
+            understanding_indexes,
+            generation_indexes,
+        )
+
+    def forward_language_with_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        kv_cache: LanceKVCache,
+        attention_backend: KVAttentionBackend = reference_kv_sdpa,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        return self.language_model.model.forward_with_kv_cache(
+            hidden_states,
+            position_ids,
+            understanding_indexes,
+            generation_indexes,
+            kv_cache,
+            attention_backend,
+            is_causal,
         )
 
     def compute_heads(

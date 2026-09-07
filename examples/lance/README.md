@@ -102,6 +102,16 @@ python convert_lance_checkpoint.py verify-dcp \
 转换器拒绝覆盖非空目录，并同时写入 `release/.metadata`、
 `latest_checkpointed_iteration.txt` 和带源文件 SHA-256 的转换 manifest。
 
+原生模型也提供逐 tensor streaming loader。它在写入模型前执行同一完整审计，每次只从 CPU
+materialize 一个源 tensor；需要先构造非 meta 的 BF16 `LanceNativeModel`，再调用
+`get_native_checkpoint_loader()` 返回的加载函数。原生 evaluation 推荐同时启用
+`AscendBlockAttentionBackend`、`AscendVisionAttentionBackend` 和
+`AscendKVCacheAttentionBackend`；KV-cached sampler 可由 `get_native_cached_sampler()` 获取。
+
+原生缓存路径只接受能证明等价的“静态 condition prefix + 连续 noisy-VAE suffix”。常见 T2I/T2V
+可直接使用；复杂 edit 模板若目标 token 非连续后缀会主动报错，应回退到完整序列 sampler，不能
+为了性能改变原注意力关系。
+
 开发时若只通过 HTTP Range 获取了 header，可额外使用 `--metadata-only` 检查结构；该结果明确
 标记为 metadata-only，不能作为推理或 evaluation 的完整文件门禁。
 
@@ -296,3 +306,9 @@ python prepare_lance_training.py \
 `qwen2_5_vl` 表示论文复现初始化：加载 Qwen2.5-VL understanding 参数并复制到 generation
 专家；`random` 才表示所有参数严格随机初始化；`lance_checkpoint` 只用于续训/微调。三者会写入
 不同 provenance 标签，PT 不允许用 Lance checkpoint 冒充 from-scratch。
+
+官方 Lance `PackedDataset` 可继续负责 tokenizer、模板和 parquet 采样。冻结 Wan2.2 VAE/ViT
+编码后，使用 `prepare_upstream_lance_batch()` 转为原生 `LanceTrainingBatch`；该适配保留
+`split_lens/attn_modes`，并独立计算逐 token MoT 路由，因此 `full_noise` split 内的视觉边界文本
+仍走 understanding expert，VAE token 仍走 generation expert。长序列应选择 `attention_backend="ascend"`，
+不得生成 dense mask。

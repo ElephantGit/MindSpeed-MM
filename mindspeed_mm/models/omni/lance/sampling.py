@@ -5,7 +5,12 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from .modeling_lance import LanceNativeModel
+from .modeling_lance import (
+    KVAttentionBackend,
+    LanceKVCache,
+    LanceNativeModel,
+    reference_kv_sdpa,
+)
 from .training_lance import shift_timesteps
 from .sequence import LancePackedSequence
 
@@ -72,6 +77,20 @@ class LanceDenoiseContext:
             _validate_indexes("ViT", self.vit_indexes, length)
             if self.vit_embeddings.shape != (self.vit_indexes.numel(), model.config.hidden_size):
                 raise LanceSamplingError("vit_embeddings shape does not match ViT indexes")
+
+
+@dataclass(frozen=True)
+class LanceCachedDenoiseState:
+    """Compiled prefix cache for the common condition + noisy-VAE topology."""
+
+    context: LanceDenoiseContext
+    kv_cache: LanceKVCache
+    query_position_ids: torch.Tensor
+    query_understanding_indexes: torch.Tensor
+    query_generation_indexes: torch.Tensor
+    query_latent_position_ids: torch.Tensor
+    attention_backend: KVAttentionBackend
+    is_causal: bool
 
 
 def _validate_indexes(name: str, indexes: torch.Tensor, upper_bound: int) -> None:
@@ -186,6 +205,168 @@ def predict_native_velocity(
     return model.llm2vae(hidden_states[context.prediction_indexes])
 
 
+def _condition_attention_contract(
+    context: LanceDenoiseContext,
+    condition_length: int,
+) -> Tuple[Any, bool]:
+    """Extract a cacheable prefix and determine the noisy-query mask mode."""
+
+    query_length = context.token_ids.numel() - condition_length
+    if isinstance(context.attention_mask, LancePackedSequence):
+        packed = context.attention_mask
+        if len(packed.documents) != 1:
+            raise LanceSamplingError("KV-cache sampling currently requires one packed document")
+        segments = packed.documents[0].segments
+        if len(segments) < 2 or segments[-1].length != query_length:
+            raise LanceSamplingError("KV-cache query must be the final packed segment")
+        if any(segment.normalized_attention_mode == "noise" for segment in segments[:-1]):
+            raise LanceSamplingError(
+                "KV-cache condition cannot include noise segments hidden from the final query"
+            )
+        condition = LancePackedSequence(
+            (
+                type(packed.documents[0])(
+                    packed.documents[0].sample_id,
+                    segments[:-1],
+                ),
+            )
+        )
+        if condition.length != condition_length:
+            raise LanceSamplingError("KV-cache condition/query boundary must align to a segment")
+        return condition, segments[-1].normalized_attention_mode == "causal"
+
+    mask = context.attention_mask
+    if mask is None or mask.shape != (context.token_ids.numel(), context.token_ids.numel()):
+        raise LanceSamplingError("KV-cache sampling requires dense or packed attention metadata")
+    if bool(mask[:condition_length, condition_length:].any()):
+        raise LanceSamplingError("condition tokens must not attend to dynamic query tokens")
+    if not bool(mask[condition_length:, :condition_length].all()):
+        raise LanceSamplingError("dynamic query tokens must attend to the entire condition prefix")
+    query_mask = mask[condition_length:, condition_length:].bool()
+    full = torch.ones_like(query_mask)
+    causal = full.tril()
+    if torch.equal(query_mask, full):
+        is_causal = False
+    elif torch.equal(query_mask, causal):
+        is_causal = True
+    else:
+        raise LanceSamplingError("dynamic query self-attention must be full or causal")
+    return mask[:condition_length, :condition_length], is_causal
+
+
+def compile_native_kv_cache(
+    model: LanceNativeModel,
+    context: LanceDenoiseContext,
+    latents: torch.Tensor,
+    *,
+    attention_backend: KVAttentionBackend = reference_kv_sdpa,
+) -> LanceCachedDenoiseState:
+    """Prefill static condition K/V once for diffusion sampling.
+
+    The cacheable native layout is deliberately strict: prediction tokens are
+    one contiguous VAE suffix.  Refusing a non-equivalent split prevents silent
+    attention changes for uncommon editing templates.
+    """
+
+    if latents.ndim != 2 or latents.shape[1] != model.config.patch_latent_dim:
+        raise LanceSamplingError("latents must have shape [tokens, patch_latent_dim]")
+    context.validate(model, latents.shape[0])
+    query_length = int(context.prediction_indexes.numel())
+    if query_length == 0:
+        raise LanceSamplingError("KV-cache sampling requires prediction tokens")
+    condition_length = int(context.token_ids.numel()) - query_length
+    expected_query = torch.arange(
+        condition_length,
+        context.token_ids.numel(),
+        dtype=torch.long,
+        device=context.prediction_indexes.device,
+    )
+    if not torch.equal(context.prediction_indexes, expected_query):
+        raise LanceSamplingError("prediction tokens must be a contiguous sequence suffix")
+    mapped_predictions = context.vae_indexes[context.prediction_latent_indexes]
+    if not torch.equal(mapped_predictions, context.prediction_indexes):
+        raise LanceSamplingError("prediction tokens must map exactly to prediction latent rows")
+    if condition_length <= 0:
+        raise LanceSamplingError("KV-cache sampling requires a non-empty condition prefix")
+
+    condition_attention, is_causal = _condition_attention_contract(context, condition_length)
+    token_embeddings = model.language_model.model.embed_tokens(context.token_ids)
+    sequence = token_embeddings.new_zeros((context.token_ids.numel(), model.config.hidden_size))
+    sequence[context.text_indexes] = token_embeddings[context.text_indexes]
+    if context.vit_indexes is not None:
+        sequence[context.vit_indexes] = context.vit_embeddings.to(sequence.dtype)
+    zero_timesteps = latents.new_zeros((latents.shape[0],))
+    sequence[context.vae_indexes] = (
+        model.vae2llm(latents)
+        + model.time_embedder(zero_timesteps)
+        + model.latent_pos_embed(context.latent_position_ids)
+    ).to(sequence.dtype)
+
+    condition_understanding = context.understanding_indexes[
+        context.understanding_indexes < condition_length
+    ]
+    condition_generation = context.generation_indexes[
+        context.generation_indexes < condition_length
+    ]
+    _, kv_cache = model.build_language_kv_cache(
+        sequence[:condition_length],
+        context.position_ids[:, :condition_length],
+        condition_attention,
+        condition_understanding,
+        condition_generation,
+    )
+    query_understanding = (
+        context.understanding_indexes[context.understanding_indexes >= condition_length]
+        - condition_length
+    )
+    query_generation = (
+        context.generation_indexes[context.generation_indexes >= condition_length]
+        - condition_length
+    )
+    return LanceCachedDenoiseState(
+        context=context,
+        kv_cache=kv_cache,
+        query_position_ids=context.position_ids[:, condition_length:],
+        query_understanding_indexes=query_understanding,
+        query_generation_indexes=query_generation,
+        query_latent_position_ids=context.latent_position_ids[context.prediction_latent_indexes],
+        attention_backend=attention_backend,
+        is_causal=is_causal,
+    )
+
+
+def predict_cached_native_velocity(
+    model: LanceNativeModel,
+    state: LanceCachedDenoiseState,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+) -> torch.Tensor:
+    """Recompute only the dynamic VAE query against a compiled condition."""
+
+    context = state.context
+    if latents.ndim != 2 or latents.shape[1] != model.config.patch_latent_dim:
+        raise LanceSamplingError("latents must have shape [tokens, patch_latent_dim]")
+    if timestep.ndim != 0 or not 0.0 <= float(timestep.item()) <= 1.0:
+        raise LanceSamplingError("timestep must be a scalar in [0, 1]")
+    query_latents = latents[context.prediction_latent_indexes]
+    query_timesteps = timestep.to(query_latents.dtype).expand(query_latents.shape[0])
+    query = (
+        model.vae2llm(query_latents)
+        + model.time_embedder(query_timesteps)
+        + model.latent_pos_embed(state.query_latent_position_ids)
+    )
+    hidden_states = model.forward_language_with_kv_cache(
+        query,
+        state.query_position_ids,
+        state.query_understanding_indexes,
+        state.query_generation_indexes,
+        state.kv_cache,
+        attention_backend=state.attention_backend,
+        is_causal=state.is_causal,
+    )
+    return model.llm2vae(hidden_states)
+
+
 VelocityFunction = Callable[[torch.Tensor, torch.Tensor, str], torch.Tensor]
 
 
@@ -270,6 +451,63 @@ def sample_native_lance(
         if branch_context is None:
             raise LanceSamplingError("missing {} context".format(branch.replace("_", "-")))
         return predict_native_velocity(model, branch_context, latents, timestep)
+
+    return euler_flow_sample(
+        initial_latents,
+        velocity,
+        num_steps=num_steps,
+        timestep_shift=timestep_shift,
+        update_indexes=context.prediction_latent_indexes,
+        cfg_interval=cfg_interval,
+        text_scale=text_scale,
+        vision_scale=vision_scale,
+        renorm_min=renorm_min,
+        renorm_type=renorm_type,
+    )
+
+
+def sample_native_lance_cached(
+    model: LanceNativeModel,
+    context: LanceDenoiseContext,
+    initial_latents: torch.Tensor,
+    *,
+    num_steps: int,
+    timestep_shift: float,
+    text_unconditional_context: Optional[LanceDenoiseContext] = None,
+    vision_unconditional_context: Optional[LanceDenoiseContext] = None,
+    cfg_interval: Tuple[float, float] = (0.0, 1.0),
+    text_scale: float = 1.0,
+    vision_scale: float = 1.0,
+    renorm_min: float = 0.0,
+    renorm_type: str = "global",
+    attention_backend: KVAttentionBackend = reference_kv_sdpa,
+) -> torch.Tensor:
+    """Euler/CFG sampling with one KV prefill per active guidance branch."""
+
+    contexts = {
+        "conditional": context,
+        "text_unconditional": text_unconditional_context,
+        "vision_unconditional": vision_unconditional_context,
+    }
+    required = {"conditional"}
+    if text_scale > 1.0 or vision_scale > 1.0:
+        required.add("text_unconditional")
+    if vision_scale > 1.0:
+        required.add("vision_unconditional")
+    states = {}
+    for branch in required:
+        branch_context = contexts[branch]
+        if branch_context is None:
+            raise LanceSamplingError("missing {} context".format(branch.replace("_", "-")))
+        states[branch] = compile_native_kv_cache(
+            model,
+            branch_context,
+            initial_latents,
+            attention_backend=attention_backend,
+        )
+
+    def velocity(latents: torch.Tensor, timestep: torch.Tensor, branch: str) -> torch.Tensor:
+        return predict_cached_native_velocity(model, states[branch], latents, timestep)
 
     return euler_flow_sample(
         initial_latents,

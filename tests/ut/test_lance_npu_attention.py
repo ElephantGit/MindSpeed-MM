@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 from mindspeed_mm.models.omni.lance.modeling_lance import reference_sdpa
 from mindspeed_mm.models.omni.lance.npu_attention import (
     AscendBlockAttentionBackend,
+    AscendKVCacheAttentionBackend,
     AscendVisionAttentionBackend,
     LanceAscendAttentionError,
 )
@@ -137,3 +138,24 @@ def test_vision_backend_uses_one_full_tnd_varlen_call():
     assert FakeVisionTorchNPU.call["actual_seq_kvlen"] == (2, 5)
     assert FakeVisionTorchNPU.call["atten_mask"] is None
     assert FakeVisionTorchNPU.call["sparse_mode"] == 0
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_kv_cache_backend_matches_non_equal_length_oracle(is_causal):
+    FakeTorchNPU.calls = []
+    torch.manual_seed(47)
+    query = torch.randn(3, 4, 8)
+    key = torch.randn(8, 2, 8)
+    value = torch.randn(8, 2, 8)
+    row = torch.arange(3).unsqueeze(1)
+    column = torch.arange(8).unsqueeze(0)
+    mask = column <= row + 5 if is_causal else torch.ones(3, 8, dtype=torch.bool)
+    expected = reference_sdpa(query, key, value, mask)
+    backend = AscendKVCacheAttentionBackend(torch_npu_module=FakeTorchNPU)
+    actual = backend(query, key, value, is_causal)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    call = FakeTorchNPU.calls[-1]
+    assert call["actual_seq_qlen"] == (3,)
+    assert call["actual_seq_kvlen"] == (8,)
+    assert call["sparse_mode"] == (3 if is_causal else 0)
+    assert (call["atten_mask"] is not None) is is_causal
