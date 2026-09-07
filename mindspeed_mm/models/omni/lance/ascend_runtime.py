@@ -127,6 +127,29 @@ def _install_flash_attn_shim(torch: Any, torch_npu: Any) -> None:
     sys.modules["flash_attn.layers.rotary"] = rotary_module
 
 
+def _patch_transformers_flash_attn_probe() -> None:
+    """Make Transformers expose the process-local FlashAttention shim.
+
+    ``transformers.utils.is_flash_attn_2_available`` checks installed package
+    metadata in addition to importability.  The Lance NPU adapter deliberately
+    installs an in-memory compatibility module rather than a fake Python
+    distribution, so the stock probe returns ``False`` and Lance binds both
+    ``flash_attn_varlen_func`` and ``apply_rotary_emb`` to ``None``.  Override
+    only the probe imported by the dedicated Lance process after the shim has
+    been installed.
+    """
+    transformers_utils = importlib.import_module("transformers.utils")
+    current = getattr(transformers_utils, "is_flash_attn_2_available", None)
+    if getattr(current, "_lance_npu_compatible", False):
+        return
+
+    def is_flash_attn_2_available() -> bool:
+        return True
+
+    is_flash_attn_2_available._lance_npu_compatible = True
+    transformers_utils.is_flash_attn_2_available = is_flash_attn_2_available
+
+
 def _patch_distributed_backend(torch: Any) -> None:
     dist = torch.distributed
     original = dist.init_process_group
@@ -188,6 +211,7 @@ def enable_lance_ascend_runtime() -> LanceRuntimeInfo:
     _patch_distributed_backend(torch)
     _patch_autocast(torch)
     _install_flash_attn_shim(torch, torch_npu)
+    _patch_transformers_flash_attn_probe()
 
     return LanceRuntimeInfo(
         device_type="npu",

@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ os.environ.setdefault("NON_MEGATRON", "true")
 
 from mindspeed_mm.models.omni.lance.ascend_runtime import (
     _install_flash_attn_shim,
+    _patch_transformers_flash_attn_probe,
     cumulative_lengths,
 )
 from mindspeed_mm.models.omni.lance.runner import LanceSourceError, resolve_entrypoint
@@ -205,6 +207,26 @@ def test_npu_flash_attention_shim_uses_tnd_and_causal_mode():
     assert calls[0]["actual_seq_kvlen"] == (6, 12)
     assert calls[0]["sparse_mode"] == 3
     assert calls[0]["atten_mask"] == "causal-mask"
+
+
+def test_transformers_flash_attention_probe_accepts_process_local_shim(monkeypatch):
+    class FakeTransformersUtils:
+        @staticmethod
+        def is_flash_attn_2_available():
+            return False
+
+    original_import_module = importlib.import_module
+
+    def fake_import_module(name):
+        if name == "transformers.utils":
+            return FakeTransformersUtils
+        return original_import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    _patch_transformers_flash_attn_probe()
+
+    assert FakeTransformersUtils.is_flash_attn_2_available() is True
+    assert FakeTransformersUtils.is_flash_attn_2_available._lance_npu_compatible is True
 
 
 def test_entrypoint_cannot_escape_source_root(tmp_path):
