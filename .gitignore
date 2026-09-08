@@ -158,3 +158,6 @@ mindspeed
 /tests/st/run_logs/
 
 fusion_result.json
+
+# eval results
+results/
