@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 
 @dataclass(frozen=True)
 class LanceRuntimeInfo:
+    execution_mode: str
     device_type: str
     distributed_backend: str
     torch_version: str
@@ -41,7 +42,12 @@ def cumulative_lengths(cu_seqlens: Any) -> Tuple[int, ...]:
     return tuple(int(value) for value in values[1:])
 
 
-def _install_flash_attn_shim(torch: Any, torch_npu: Any) -> None:
+def _install_flash_attn_shim(
+    torch: Any,
+    torch_npu: Any,
+    *,
+    allow_dropout: bool = False,
+) -> None:
     """Expose the subset of flash_attn used by Lance through an NPU kernel."""
     causal_masks: Dict[str, Any] = {}
 
@@ -61,7 +67,9 @@ def _install_flash_attn_shim(torch: Any, torch_npu: Any) -> None:
         del max_seqlen_q, max_seqlen_k
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             raise ValueError("Lance NPU varlen attention expects TND tensors")
-        if dropout_p and dropout_p > 0:
+        if not 0.0 <= dropout_p < 1.0:
+            raise ValueError("attention dropout_p must be in [0, 1)")
+        if dropout_p and not allow_dropout:
             raise ValueError("Lance inference requires attention dropout_p=0")
 
         scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
@@ -81,7 +89,7 @@ def _install_flash_attn_shim(torch: Any, torch_npu: Any) -> None:
             "padding_mask": None,
             "atten_mask": atten_mask,
             "scale": scale,
-            "keep_prob": 1.0,
+            "keep_prob": 1.0 - dropout_p,
             "actual_seq_qlen": cumulative_lengths(cu_seqlens_q),
             "actual_seq_kvlen": cumulative_lengths(cu_seqlens_k),
             "sparse_mode": 3 if causal else 0,
@@ -190,14 +198,32 @@ def _patch_cuda_namespace(torch: Any) -> None:
         setattr(torch.cuda, name, value)
 
 
-def enable_lance_ascend_runtime() -> LanceRuntimeInfo:
+def _patch_device_mesh() -> None:
+    """Translate the CUDA device spelling used by upstream FSDP mesh setup."""
+
+    device_mesh = importlib.import_module("torch.distributed.device_mesh")
+    original = device_mesh.init_device_mesh
+    if getattr(original, "_lance_npu_compatible", False):
+        return
+
+    def init_device_mesh(device_type: str, *args: Any, **kwargs: Any) -> Any:
+        return original("npu" if device_type == "cuda" else device_type, *args, **kwargs)
+
+    init_device_mesh._lance_npu_compatible = True
+    device_mesh.init_device_mesh = init_device_mesh
+
+
+def enable_lance_ascend_runtime(execution_mode: str = "inference") -> LanceRuntimeInfo:
     """Install process-local compatibility hooks and return runtime metadata."""
+
+    if execution_mode not in ("inference", "training"):
+        raise ValueError("execution_mode must be 'inference' or 'training'")
     try:
         torch = importlib.import_module("torch")
         torch_npu = importlib.import_module("torch_npu")
     except ImportError as exc:
         raise RuntimeError(
-            "Lance Ascend inference requires the MindSpeed-MM PyTorch/NPU environment "
+            "Lance Ascend execution requires the MindSpeed-MM PyTorch/NPU environment "
             "(torch and torch_npu must both be installed)."
         ) from exc
 
@@ -210,10 +236,17 @@ def enable_lance_ascend_runtime() -> LanceRuntimeInfo:
     _patch_cuda_namespace(torch)
     _patch_distributed_backend(torch)
     _patch_autocast(torch)
-    _install_flash_attn_shim(torch, torch_npu)
+    if execution_mode == "training":
+        _patch_device_mesh()
+    _install_flash_attn_shim(
+        torch,
+        torch_npu,
+        allow_dropout=execution_mode == "training",
+    )
     _patch_transformers_flash_attn_probe()
 
     return LanceRuntimeInfo(
+        execution_mode=execution_mode,
         device_type="npu",
         distributed_backend="hccl",
         torch_version=str(getattr(torch, "__version__", "unknown")),

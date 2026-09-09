@@ -8,6 +8,7 @@ os.environ.setdefault("NON_MEGATRON", "true")
 
 from mindspeed_mm.models.omni.lance.ascend_runtime import (
     _install_flash_attn_shim,
+    _patch_device_mesh,
     _patch_transformers_flash_attn_probe,
     cumulative_lengths,
 )
@@ -195,6 +196,25 @@ def test_npu_flash_attention_shim_uses_tnd_and_causal_mode():
             FakeCumulativeLengths([0, 6, 12]),
             5, 7, causal=True,
         )
+        try:
+            sys.modules["flash_attn"].flash_attn_varlen_func(
+                FakeTensor(), FakeTensor(), FakeTensor(),
+                FakeCumulativeLengths([0, 4, 9]),
+                FakeCumulativeLengths([0, 6, 12]),
+                5, 7, dropout_p=0.25,
+            )
+        except ValueError as exc:
+            assert "inference requires" in str(exc)
+        else:
+            raise AssertionError("inference attention dropout must be rejected")
+
+        _install_flash_attn_shim(FakeTorch, FakeTorchNpu, allow_dropout=True)
+        training_output = sys.modules["flash_attn"].flash_attn_varlen_func(
+            FakeTensor(), FakeTensor(), FakeTensor(),
+            FakeCumulativeLengths([0, 4, 9]),
+            FakeCumulativeLengths([0, 6, 12]),
+            5, 7, dropout_p=0.25,
+        )
     finally:
         for name, value in old_modules.items():
             if value is None:
@@ -202,11 +222,13 @@ def test_npu_flash_attention_shim_uses_tnd_and_causal_mode():
             else:
                 sys.modules[name] = value
     assert output == "output"
+    assert training_output == "output"
     assert calls[0]["input_layout"] == "TND"
     assert calls[0]["actual_seq_qlen"] == (4, 9)
     assert calls[0]["actual_seq_kvlen"] == (6, 12)
     assert calls[0]["sparse_mode"] == 3
     assert calls[0]["atten_mask"] == "causal-mask"
+    assert calls[1]["keep_prob"] == 0.75
 
 
 def test_transformers_flash_attention_probe_accepts_process_local_shim(monkeypatch):
@@ -227,6 +249,32 @@ def test_transformers_flash_attention_probe_accepts_process_local_shim(monkeypat
 
     assert FakeTransformersUtils.is_flash_attn_2_available() is True
     assert FakeTransformersUtils.is_flash_attn_2_available._lance_npu_compatible is True
+
+
+def test_training_device_mesh_maps_cuda_to_npu(monkeypatch):
+    calls = []
+
+    class FakeDeviceMeshModule:
+        @staticmethod
+        def init_device_mesh(device_type, *args, **kwargs):
+            calls.append((device_type, args, kwargs))
+            return "mesh"
+
+    original_import_module = importlib.import_module
+
+    def fake_import_module(name):
+        if name == "torch.distributed.device_mesh":
+            return FakeDeviceMeshModule
+        return original_import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    _patch_device_mesh()
+    assert FakeDeviceMeshModule.init_device_mesh(
+        "cuda", mesh_shape=(1, 8), mesh_dim_names=("replicate", "shard")
+    ) == "mesh"
+    assert calls == [
+        ("npu", (), {"mesh_shape": (1, 8), "mesh_dim_names": ("replicate", "shard")})
+    ]
 
 
 def test_entrypoint_cannot_escape_source_root(tmp_path):

@@ -49,7 +49,17 @@ def resolve_entrypoint(source_root: Path, entrypoint: str) -> Path:
     return candidate
 
 
-def describe_run(source_root: Path, entrypoint: str, arguments: List[str]) -> Dict[str, object]:
+def describe_run(
+    source_root: Path,
+    entrypoint: str,
+    arguments: List[str],
+    execution_mode: str = "inference",
+    strict_training: bool = False,
+) -> Dict[str, object]:
+    if execution_mode not in ("inference", "training"):
+        raise LanceSourceError("execution_mode must be 'inference' or 'training'")
+    if strict_training and execution_mode != "training":
+        raise LanceSourceError("strict_training is only valid for training execution")
     return {
         "source_root": str(source_root),
         "entrypoint": str(resolve_entrypoint(source_root, entrypoint)),
@@ -57,6 +67,10 @@ def describe_run(source_root: Path, entrypoint: str, arguments: List[str]) -> Di
         "accelerator": "ascend-npu",
         "distributed_backend": "hccl",
         "attention_backend": "torch_npu.npu_fusion_attention:TND",
+        "execution_mode": execution_mode,
+        "failure_policy": (
+            "fail-fast-on-training-step-exception" if strict_training else "upstream-default"
+        ),
     }
 
 
@@ -65,17 +79,31 @@ def run_lance_entrypoint(
     entrypoint: str,
     arguments: List[str],
     dry_run: bool = False,
+    execution_mode: str = "inference",
+    strict_training: bool = False,
 ) -> Dict[str, object]:
     source = resolve_lance_source(source_root)
-    description = describe_run(source, entrypoint, arguments)
+    description = describe_run(
+        source,
+        entrypoint,
+        arguments,
+        execution_mode,
+        strict_training,
+    )
+    script = resolve_entrypoint(source, entrypoint)
+    compiled_entrypoint = None
+    if strict_training:
+        from .upstream_training import compile_strict_training_entrypoint
+
+        compiled_entrypoint, transform = compile_strict_training_entrypoint(script)
+        description["source_transform"] = transform
     if dry_run:
         return description
 
     from .ascend_runtime import enable_lance_ascend_runtime
 
-    runtime = enable_lance_ascend_runtime()
+    runtime = enable_lance_ascend_runtime(execution_mode=execution_mode)
     description["runtime"] = runtime.to_dict()
-    script = resolve_entrypoint(source, entrypoint)
     original_argv = sys.argv[:]
     original_cwd = Path.cwd()
     inserted = str(source) not in sys.path
@@ -84,7 +112,17 @@ def run_lance_entrypoint(
     try:
         sys.argv = [str(script)] + list(arguments)
         os.chdir(str(source))
-        runpy.run_path(str(script), run_name="__main__")
+        if compiled_entrypoint is None:
+            runpy.run_path(str(script), run_name="__main__")
+        else:
+            namespace = {
+                "__name__": "__main__",
+                "__file__": str(script),
+                "__cached__": None,
+                "__package__": None,
+                "__spec__": None,
+            }
+            exec(compiled_entrypoint, namespace)
     finally:
         os.chdir(str(original_cwd))
         sys.argv = original_argv
