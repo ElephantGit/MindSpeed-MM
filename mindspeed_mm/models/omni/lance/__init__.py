@@ -18,6 +18,18 @@ from .sequence import (
     LanceSequenceError,
 )
 from .training_contract import PAPER_OPTIMIZER, LanceStage, LanceStageError, STAGES, training_manifest
+from .training_bridge import (
+    LanceTrainingBridgeError,
+    UPSTREAM_TRAINING_ENTRYPOINT,
+    build_training_bridge_preflight,
+    validate_training_manifest,
+    validate_upstream_training_source,
+)
+from .upstream_training import (
+    LanceUpstreamTrainingError,
+    compile_strict_training_entrypoint,
+    validate_strict_training_entrypoint,
+)
 from .task_mixer import LanceTaskMixer, LanceTaskMixerError, group_by_token_budget
 
 
@@ -83,11 +95,16 @@ __all__ = [
     "LanceStageError",
     "LanceTaskMixer",
     "LanceTaskMixerError",
+    "LanceTrainingBridgeError",
+    "LanceUpstreamTrainingError",
     "STAGES",
     "PAPER_OPTIMIZER",
+    "UPSTREAM_TRAINING_ENTRYPOINT",
     "audit_checkpoint_metadata",
     "build_checkpoint_conversion_plan",
+    "build_training_bridge_preflight",
     "convert_safetensors_to_dcp",
+    "compile_strict_training_entrypoint",
     "expected_state_shapes",
     "read_safetensors_header",
     "get_native_model_class",
@@ -100,5 +117,8 @@ __all__ = [
     "resolve_lance_source",
     "run_lance_entrypoint",
     "training_manifest",
+    "validate_training_manifest",
+    "validate_strict_training_entrypoint",
+    "validate_upstream_training_source",
     "verify_dcp_metadata",
 ]
