@@ -1,7 +1,7 @@
 # Lance 适配验证记录
 
 本记录区分三类结果：已在当前工作区实际执行、只验证元数据，以及必须在 Ascend 节点执行。
-记录日期为 2026-09-07。
+记录日期为 2026-09-08。
 
 ## 已实际执行并通过
 
@@ -87,12 +87,27 @@ python inference_lance.py --runtime-check
 节点并激活 MindSpeed-MM 镜像后，应首先运行该命令；只有 `status=passed` 且
 `max_abs_error <= 0.08` 才进入 checkpoint 推理和全量 evaluation。
 
+## 上游 PT 桥 preflight
+
+在无需导入 torch 的路径上，已使用同级真实 Lance checkout 和其
+`config/train_local/unified.yaml` 完成 PT preflight：
+
+- Lance revision：`4baeee086648996f6ab12e673cbe461b0b149997`，checkout clean；
+- `train/unified_train.py` SHA-256：`7c537026be87962396171a36b85068554c6dbb02dd8f34fa3eb0fd5c837fef77`；
+- dataset YAML SHA-256：`f45cf0b175d8270fcdb2c0ef8dfe6f7c6ca43125f5839f559e6b2f7f971ac92c`；
+- PT 350K steps、warmup、token budget、loss/dropout、AdamW/EMA、冻结策略和 1x8 FSDP 拓扑均通过；
+- fail-fast AST 门禁精确识别 1 个官方 step exception handler，未修改上游文件。
+
+该结果只证明源码和启动契约闭合；训练态 NPU attention backward、FSDP/HCCL、EMA 内存和 checkpoint
+恢复仍必须在目标 8 NPU 环境验证。
+
 ## 最新验证
 
 ```text
 115 passed (temporary CPU torch validation runtime)
 Python compilation: passed
 CLI help/preflight: passed
+Upstream PT bridge preflight: ready
 git diff --check: passed
 Released dataset preflight: 4/4 valid
 Official checkpoint header contract: image/video valid metadata

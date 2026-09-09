@@ -296,6 +296,7 @@ python prepare_lance_training.py \
   --init-path /path/to/Qwen2.5-VL-3B-Instruct \
   --variant video \
   --world-size 64 \
+  --dataset-manifest /path/to/Lance/config/train/pt.yaml \
   --dataset-manifest /path/to/video-generation.json \
   --dataset-manifest /path/to/video-understanding.json \
   --dataset-manifest /path/to/image-generation.json \
@@ -306,6 +307,53 @@ python prepare_lance_training.py \
 `qwen2_5_vl` 表示论文复现初始化：加载 Qwen2.5-VL understanding 参数并复制到 generation
 专家；`random` 才表示所有参数严格随机初始化；`lance_checkpoint` 只用于续训/微调。三者会写入
 不同 provenance 标签，PT 不允许用 Lance checkpoint 冒充 from-scratch。
+
+## PT 上游基线桥
+
+当前已增加 `pretrain_lance.py`，先以官方 `train/unified_train.py` 建立 Ascend 训练基线。它不复制或
+修改 Lance checkout，而是在初始化 torch/NPU 前执行以下强门禁：
+
+- 上游训练源码必须完整、处于 clean Git revision；
+- 训练 manifest、初始化路径和 PackedDataset YAML 必须存在，数据 YAML 大小及 SHA-256 不得漂移；
+- PT steps、token budget、loss/dropout、AdamW、EMA、冻结策略和 FSDP 拓扑必须与内置阶段契约一致；
+- `WORLD_SIZE` 必须与 manifest 及 `num_replicate * num_shard` 一致；
+- 官方 step 级宽泛异常处理会在内存中转换为 fail-fast，转换只匹配已审计的 AST 结构，上游文件不落盘。
+
+manifest 中至少要包含实际传给 `--dataset_config_file` 的 PackedDataset YAML；其他数据清单可以继续
+附加。单机 8 卡 PT 的准备和只读 preflight 示例：
+
+```bash
+python prepare_lance_training.py \
+  --stage pt \
+  --init-mode qwen2_5_vl \
+  --init-path /path/to/Qwen2.5-VL-3B-Instruct \
+  --variant video \
+  --world-size 8 \
+  --dataset-manifest /path/to/Lance/config/train/pt.yaml \
+  --output /path/to/results/lance-pt-manifest.json
+
+TRAINING_MANIFEST=/path/to/results/lance-pt-manifest.json \
+QWEN_PATH=/path/to/Qwen2.5-VL-3B-Instruct \
+VIT_PATH=/path/to/Qwen2.5-VL-ViT \
+DATASET_CONFIG_FILE=/path/to/Lance/config/train/pt.yaml \
+PREFLIGHT_ONLY=1 \
+bash scripts/pretrain_lance_pt.sh
+```
+
+正式运行前，将 Wan2.2 VAE 放到官方 `config/path_default.yaml` 解析出的路径，然后执行：
+
+```bash
+TRAINING_MANIFEST=/path/to/results/lance-pt-manifest.json \
+QWEN_PATH=/path/to/Qwen2.5-VL-3B-Instruct \
+VIT_PATH=/path/to/Qwen2.5-VL-ViT \
+DATASET_CONFIG_FILE=/path/to/Lance/config/train/pt.yaml \
+bash scripts/pretrain_lance_pt.sh
+```
+
+设置 `SMOKE_TEST=1` 会切换为 20 steps 和缩小后的 token budget；`--smoke-test` 只允许缩小 steps、
+warmup 和三项 token budget，其余语义参数仍须严格一致。当前上游桥
+明确拒绝 `random` 初始化和 RL：官方入口没有严格随机初始化路径，且 `unified_train.py` 是监督训练
+循环。二者继续由原生 TrainEngine 路线实现。
 
 官方 Lance `PackedDataset` 可继续负责 tokenizer、模板和 parquet 采样。冻结 Wan2.2 VAE/ViT
 编码后，使用 `prepare_upstream_lance_batch()` 转为原生 `LanceTrainingBatch`；该适配保留

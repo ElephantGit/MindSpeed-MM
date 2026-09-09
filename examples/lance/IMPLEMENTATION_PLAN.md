@@ -146,8 +146,16 @@ MoT 路由。尚待在目标镜像加载生产 tokenizer/Wan-VAE 权重并跑真
 当前已落地 AdamW、论文 warmup/constant/5-cycle cosine scheduler、gradient clipping、独立 EMA 模型、
 decoder activation checkpointing，以及包含 model/optimizer/EMA/数据游标/混合 RNG/noise RNG/
 scheduler 的 DCP state contract。EMA 以顶层 sharded model 保存，不会复制进每个 rank 的 extra state。
-待完成项是把这些组件接入 MindSpeed-MM 通用 FSDP2 TrainEngine，并在 Ascend 多卡执行 10+resume
-闭环测试。
+
+为先获得可归因的训练基线，已落地官方 `train/unified_train.py` 的 Ascend 桥：启动前绑定 clean Lance
+revision、训练入口 SHA、数据 YAML SHA、初始化、论文超参、冻结/EMA 与 FSDP 拓扑；训练态 runtime
+补充 HCCL、NPU device mesh、autocast 和可反传 attention dropout；官方会吞掉 step 异常的 handler
+通过窄范围 AST 转换改为 fail-fast，且不修改上游文件。该路径只覆盖官方监督训练入口，不把它误标为
+原生 FSDP2，也不用于 strict-random 或 RL。
+
+下一项是先在 8 NPU 上完成 PT 的 1 step/20 step/10+resume+10 闭环并记录 loss、吞吐、峰值内存和
+checkpoint 可恢复性；随后把已存在的原生 model/data/joint-loss/task-mixer/DCP 组件接入 MindSpeed-MM
+通用 FSDP2 TrainEngine，并以同一批次对比上游桥的 loss、梯度范数和一次参数更新。
 
 ## 阶段 III：论文训练阶段
 
@@ -178,10 +186,14 @@ T2I/T2V；CT-I/II/III 逐步提升 edit、subject-driven 和 I2V 占比；SFT �
   sampling/scorer/归一化/provenance/report；原生模型精确参数树、MoT forward/backward、3D 位置表、
   原生 Qwen2.5-VL ViT、packed attention 语义、NPU block/KV backend、KV-cached Euler/CFG sampler、
   joint CE/MSE step、官方 PackedDataset 适配、decoder activation checkpoint、论文与严格随机初始化、
-  PT/CT/SFT/RL stage manifest、streaming 权重加载、safetensors→DCP 转换与 metadata 回读；
-- 本机已验证：115 项 Lance 单测、Python 编译、CLI help、git diff whitespace，以及 image/video
+  PT/CT/SFT/RL stage manifest、streaming 权重加载、safetensors→DCP 转换与 metadata 回读；官方
+  监督训练 Ascend 基线桥、训练态 NPU runtime、严格启动 preflight 和 fail-fast 异常策略；
+- 本机已验证：115 项既有 Lance 单测、Python 编译、CLI help、git diff whitespace，以及 image/video
   官方 safetensors 真实 header 和四套官方发布 evaluation 数据；torch 相关测试使用临时 CPU
   torch 2.2.2，仅用于结构/梯度/算法语义验证，不代表目标 torch 2.7.1 + torch-npu 结果；
+- 本轮额外完成真实 clean Lance revision 上的 PT preflight：上游 revision、入口 SHA、dataset YAML
+  SHA、8 卡拓扑及论文参数均为 `ready`；当前系统无 pytest，新增用例已通过 Python 编译但尚未在完整
+  项目测试环境执行；
 - 当前阻塞于实机的项目：本机无 torch_npu、CANN、Ascend 设备、完整 checkpoint 和 scorer 权重，
   因此尚未执行真实 NPU kernel numerical/gradient test、七任务生成、全量 DCP 转换及论文分数；
 - 原生实现尚缺：生产 tokenizer/Wan-VAE 权重实载、CP/FSDP2 训练 runner、Ascend 10+resume 闭环、
