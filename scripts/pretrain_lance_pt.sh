@@ -9,6 +9,7 @@ VIT_PATH="${VIT_PATH:-${MODEL_ROOT}/Qwen2.5-VL-ViT}"
 WAN_VAE_PATH="${WAN_VAE_PATH:-${MODEL_ROOT}/Wan2.2_VAE.pth}"
 LANCE_IMAGE_MODEL_PATH="${LANCE_IMAGE_MODEL_PATH:-${MODEL_ROOT}/Lance_3B}"
 LANCE_VIDEO_MODEL_PATH="${LANCE_VIDEO_MODEL_PATH:-${MODEL_ROOT}/Lance_3B_Video}"
+DATASET_ROOT="${DATASET_ROOT:-/mnt/qs/datasets/bytedance-research/Lance_example_dataset}"
 DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
@@ -73,6 +74,39 @@ require_file "Qwen2.5-VL ViT weights" "${VIT_PATH}/vit.safetensors"
 require_file "Wan2.2 VAE" "${WAN_VAE_PATH}"
 require_file "PackedDataset config" "${DATASET_CONFIG_FILE}"
 
+# train_local YAML files resolve their datasets/... entries relative to the
+# Lance checkout. Hugging Face snapshots may either expose the task folders at
+# their root or wrap them in one additional datasets/ directory.
+DATASET_TREE_ROOT="${DATASET_ROOT}"
+LANCE_DATASET_PATH="${LANCE_SOURCE_ROOT}/datasets"
+if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/"* ]]; then
+    require_directory "Lance example dataset" "${DATASET_ROOT}"
+    if [[ ! -d "${DATASET_TREE_ROOT}/text2image" && -d "${DATASET_ROOT}/datasets/text2image" ]]; then
+        DATASET_TREE_ROOT="${DATASET_ROOT}/datasets"
+    fi
+
+    if [[ ! -e "${LANCE_DATASET_PATH}" && ! -L "${LANCE_DATASET_PATH}" ]]; then
+        ln -s "${DATASET_TREE_ROOT}" "${LANCE_DATASET_PATH}"
+    elif [[ ! -d "${LANCE_DATASET_PATH}" ]]; then
+        echo "Invalid Lance dataset path: ${LANCE_DATASET_PATH}" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml" ]]; then
+    EXPECTED_DATASET_FILES=(
+        text2image/local_256.parquet
+        text2video/local_128.parquet
+        image2image/local_256.parquet
+        video2video/local_64.parquet
+        image2text/local_256.parquet
+        video2text/local_256.parquet
+    )
+    for relative_path in "${EXPECTED_DATASET_FILES[@]}"; do
+        require_file "Lance example dataset" "${LANCE_DATASET_PATH}/${relative_path}"
+    done
+fi
+
 # The released Lance VAE loader reads config/path_default.yaml instead of a CLI
 # argument. Expose the configured weight through its gitignored downloads path
 # without modifying tracked files in the clean Lance checkout.
@@ -103,6 +137,8 @@ echo "ViT: ${VIT_PATH}"
 echo "Wan2.2 VAE: ${WAN_VAE_PATH}"
 echo "Lance image checkpoint (not used by PT): ${LANCE_IMAGE_MODEL_PATH}"
 echo "Lance video checkpoint (not used by PT): ${LANCE_VIDEO_MODEL_PATH}"
+echo "Dataset root: ${DATASET_TREE_ROOT}"
+echo "Lance dataset view: ${LANCE_DATASET_PATH}"
 echo "Dataset config: ${DATASET_CONFIG_FILE}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
 

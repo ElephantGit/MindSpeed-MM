@@ -355,6 +355,12 @@ warmup 和三项 token budget，其余语义参数仍须严格一致。当前上
 明确拒绝 `random` 初始化和 RL：官方入口没有严格随机初始化路径，且 `unified_train.py` 是监督训练
 循环。二者继续由原生 TrainEngine 路线实现。
 
+官方 `config/train_local/unified.yaml` 中的 `datasets/...` 是相对于 Lance checkout 的路径。启动脚本
+默认将 `/mnt/qs/datasets/bytedance-research/Lance_example_dataset` 映射为
+`/mnt/qs/Lance/datasets`，并在启动分布式进程前检查 unified 配置引用的六个 parquet。数据放在其他位置时
+设置 `DATASET_ROOT=/absolute/path/to/Lance_example_dataset`；如果下载目录外层还包含一个 `datasets/`
+目录，脚本会自动识别。
+
 官方 Lance `PackedDataset` 可继续负责 tokenizer、模板和 parquet 采样。冻结 Wan2.2 VAE/ViT
 编码后，使用 `prepare_upstream_lance_batch()` 转为原生 `LanceTrainingBatch`；该适配保留
 `split_lens/attn_modes`，并独立计算逐 token MoT 路由，因此 `full_noise` split 内的视觉边界文本
