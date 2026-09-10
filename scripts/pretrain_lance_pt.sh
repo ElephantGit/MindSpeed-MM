@@ -2,10 +2,18 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LANCE_SOURCE_ROOT="${LANCE_SOURCE_ROOT:-${REPO_ROOT}/../Lance}"
+LANCE_SOURCE_ROOT="${LANCE_SOURCE_ROOT:-/mnt/qs/Lance}"
+MODEL_ROOT="${MODEL_ROOT:-/mnt/qs/models/bytedance-research/Lance}"
+QWEN_PATH="${QWEN_PATH:-}"
+VIT_PATH="${VIT_PATH:-${MODEL_ROOT}/Qwen2.5-VL-ViT}"
+WAN_VAE_PATH="${WAN_VAE_PATH:-${MODEL_ROOT}/Wan2.2_VAE.pth}"
+LANCE_IMAGE_MODEL_PATH="${LANCE_IMAGE_MODEL_PATH:-${MODEL_ROOT}/Lance_3B}"
+LANCE_VIDEO_MODEL_PATH="${LANCE_VIDEO_MODEL_PATH:-${MODEL_ROOT}/Lance_3B_Video}"
+DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
 NUM_SHARD="${NUM_SHARD:-${NPROC_PER_NODE}}"
+TRAINING_MANIFEST="${TRAINING_MANIFEST:-${REPO_ROOT}/results/lance-pt-manifest.json}"
 RUN_MANIFEST="${RUN_MANIFEST:-${REPO_ROOT}/results/lance-pt-run.json}"
 OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"
 WANDB_NAME="${WANDB_NAME:-lance-pt-ascend}"
@@ -28,10 +36,75 @@ if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--preflight-only)
 fi
 
-: "${TRAINING_MANIFEST:?Set TRAINING_MANIFEST to the prepared PT manifest}"
-: "${QWEN_PATH:?Set QWEN_PATH to the Qwen2.5-VL initialization directory}"
-: "${VIT_PATH:?Set VIT_PATH to the extracted Qwen2.5-VL ViT directory}"
-: "${DATASET_CONFIG_FILE:?Set DATASET_CONFIG_FILE to the upstream PackedDataset YAML}"
+require_directory() {
+    local name="$1"
+    local path="$2"
+    if [[ ! -d "${path}" ]]; then
+        echo "Missing ${name} directory: ${path}" >&2
+        return 1
+    fi
+}
+
+require_file() {
+    local name="$1"
+    local path="$2"
+    if [[ ! -f "${path}" ]]; then
+        echo "Missing ${name} file: ${path}" >&2
+        return 1
+    fi
+}
+
+if [[ -z "${QWEN_PATH}" ]]; then
+    echo "QWEN_PATH is required for paper PT initialization." >&2
+    echo "It is not included in ${MODEL_ROOT}; do not use Lance_3B or Lance_3B_Video instead." >&2
+    exit 1
+fi
+if (( NUM_REPLICATE * NUM_SHARD != NPROC_PER_NODE )); then
+    echo "NUM_REPLICATE * NUM_SHARD must equal NPROC_PER_NODE for this single-node launcher." >&2
+    exit 1
+fi
+
+require_directory "Lance source" "${LANCE_SOURCE_ROOT}"
+require_directory "model root" "${MODEL_ROOT}"
+require_directory "Qwen2.5-VL initialization" "${QWEN_PATH}"
+require_directory "Qwen2.5-VL ViT" "${VIT_PATH}"
+require_file "Qwen2.5-VL ViT config" "${VIT_PATH}/config.json"
+require_file "Qwen2.5-VL ViT weights" "${VIT_PATH}/vit.safetensors"
+require_file "Wan2.2 VAE" "${WAN_VAE_PATH}"
+require_file "PackedDataset config" "${DATASET_CONFIG_FILE}"
+
+# The released Lance VAE loader reads config/path_default.yaml instead of a CLI
+# argument. Expose the configured weight through its gitignored downloads path
+# without modifying tracked files in the clean Lance checkout.
+LANCE_WAN_VAE_PATH="${LANCE_SOURCE_ROOT}/downloads/Wan2.2_VAE.pth"
+if [[ ! -e "${LANCE_WAN_VAE_PATH}" && ! -L "${LANCE_WAN_VAE_PATH}" ]]; then
+    mkdir -p "$(dirname "${LANCE_WAN_VAE_PATH}")"
+    ln -s "${WAN_VAE_PATH}" "${LANCE_WAN_VAE_PATH}"
+elif [[ ! -f "${LANCE_WAN_VAE_PATH}" ]]; then
+    echo "Invalid Lance Wan2.2 VAE path: ${LANCE_WAN_VAE_PATH}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${TRAINING_MANIFEST}" || "${REGENERATE_TRAINING_MANIFEST:-0}" == "1" ]]; then
+    python "${REPO_ROOT}/prepare_lance_training.py" \
+        --stage pt \
+        --init-mode qwen2_5_vl \
+        --init-path "${QWEN_PATH}" \
+        --variant video \
+        --world-size "${NPROC_PER_NODE}" \
+        --dataset-manifest "${DATASET_CONFIG_FILE}" \
+        --output "${TRAINING_MANIFEST}"
+fi
+
+echo "Lance source: ${LANCE_SOURCE_ROOT}"
+echo "Model root: ${MODEL_ROOT}"
+echo "Qwen initialization: ${QWEN_PATH}"
+echo "ViT: ${VIT_PATH}"
+echo "Wan2.2 VAE: ${WAN_VAE_PATH}"
+echo "Lance image checkpoint (not used by PT): ${LANCE_IMAGE_MODEL_PATH}"
+echo "Lance video checkpoint (not used by PT): ${LANCE_VIDEO_MODEL_PATH}"
+echo "Dataset config: ${DATASET_CONFIG_FILE}"
+echo "Training manifest: ${TRAINING_MANIFEST}"
 
 torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     "${REPO_ROOT}/pretrain_lance.py" \
@@ -48,6 +121,9 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --layer_module Qwen2MoTDecoderLayer \
     --vit_type qwen2_5_vl \
     --vae_model_type wan \
+    --max_num_frames 121 \
+    --max_latent_size 64 \
+    --latent_patch_size 1 1 1 \
     --visual_gen true \
     --visual_und true \
     --freeze_vit true \
@@ -86,4 +162,5 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --num_replicate "${NUM_REPLICATE}" \
     --num_shard "${NUM_SHARD}" \
     --outputs_dir "${OUTPUTS_DIR}" \
-    --wandb_name "${WANDB_NAME}"
+    --wandb_name "${WANDB_NAME}" \
+    --wandb_offline true
