@@ -350,10 +350,12 @@ DATASET_CONFIG_FILE=/path/to/Lance/config/train/pt.yaml \
 bash scripts/pretrain_lance_pt.sh
 ```
 
-设置 `SMOKE_TEST=1` 会切换为 20 steps、适合 768px 图像样例的缩小 token budget、
-`config/train_local/t2i_local.yaml` 和每 rank 0 个 DataLoader worker。这样首步验证不依赖容器
-`/dev/shm`，也不会让示例视频的约 6 万 token 序列阻塞轻量冒烟。可分别通过
-`DATASET_CONFIG_FILE` 和 `NUM_WORKERS` 覆盖这两个默认值。`--smoke-test` 只允许缩小 steps、
+Ascend 启动脚本默认使用每 rank 0 个 DataLoader worker，避免 8 卡任务中的多进程张量传输耗尽
+容器 `/dev/shm`。确认容器配置了足够大的共享内存后，可以显式设置 `NUM_WORKERS` 开启并行加载。
+
+设置 `SMOKE_TEST=1` 会进一步切换为 20 steps、适合 768px 图像样例的缩小 token budget 和
+`config/train_local/t2i_local.yaml`。这样也不会让示例视频的约 6 万 token 序列阻塞轻量冒烟。可通过
+`DATASET_CONFIG_FILE` 覆盖 smoke 数据配置。`--smoke-test` 只允许缩小 steps、
 warmup 和三项 token budget，其余语义参数仍须严格一致。Ascend 训练固定启用 `use_flex`；在该设备上
 它选择紧凑的 `SegmentedAttentionMask` 和 NPU fused attention，并不会执行 CUDA/PyTorch FlexAttention。
 当前上游桥

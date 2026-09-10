@@ -23,7 +23,12 @@ DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_lo
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
 NUM_SHARD="${NUM_SHARD:-${NPROC_PER_NODE}}"
-NUM_WORKERS="${NUM_WORKERS:-}"
+# A multi-process DataLoader transfers packed tensors through /dev/shm. With
+# eight ranks, the upstream default of eight workers per rank can exhaust a
+# container's shared-memory mount before the first training step. Keep the
+# Ascend launcher safe by default; users with a suitably sized /dev/shm can
+# opt in to worker processes through NUM_WORKERS.
+NUM_WORKERS="${NUM_WORKERS:-0}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 TRAINING_MANIFEST="${TRAINING_MANIFEST:-${REPO_ROOT}/results/lance-pt-manifest.json}"
 RUN_MANIFEST="${RUN_MANIFEST:-${REPO_ROOT}/results/lance-pt-run.json}"
@@ -41,14 +46,11 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     if [[ "${DATASET_CONFIG_FILE_WAS_SET}" == "0" ]]; then
         DATASET_CONFIG_FILE="${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml"
     fi
-    NUM_WORKERS="${NUM_WORKERS:-0}"
     TOTAL_STEPS=20
     WARMUP_STEPS=2
     EXPECTED_NUM_TOKENS=4096
     MAX_NUM_TOKENS=8192
     MAX_NUM_TOKENS_PER_SAMPLE=4096
-else
-    NUM_WORKERS="${NUM_WORKERS:-8}"
 fi
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--preflight-only)
