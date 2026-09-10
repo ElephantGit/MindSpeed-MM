@@ -2,6 +2,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DATASET_CONFIG_FILE_WAS_SET=0
+TRAINING_MANIFEST_WAS_SET=0
+if [[ -n "${DATASET_CONFIG_FILE:-}" ]]; then
+    DATASET_CONFIG_FILE_WAS_SET=1
+fi
+if [[ -n "${TRAINING_MANIFEST:-}" ]]; then
+    TRAINING_MANIFEST_WAS_SET=1
+fi
+
 LANCE_SOURCE_ROOT="${LANCE_SOURCE_ROOT:-/mnt/qs/Lance}"
 MODEL_ROOT="${MODEL_ROOT:-/mnt/qs/models/bytedance-research/Lance}"
 QWEN_PATH="${QWEN_PATH:-}"
@@ -14,6 +23,8 @@ DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_lo
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
 NUM_SHARD="${NUM_SHARD:-${NPROC_PER_NODE}}"
+NUM_WORKERS="${NUM_WORKERS:-}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 TRAINING_MANIFEST="${TRAINING_MANIFEST:-${REPO_ROOT}/results/lance-pt-manifest.json}"
 RUN_MANIFEST="${RUN_MANIFEST:-${REPO_ROOT}/results/lance-pt-run.json}"
 OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"
@@ -27,11 +38,17 @@ ADAPTER_FLAGS=()
 
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--smoke-test)
+    if [[ "${DATASET_CONFIG_FILE_WAS_SET}" == "0" ]]; then
+        DATASET_CONFIG_FILE="${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml"
+    fi
+    NUM_WORKERS="${NUM_WORKERS:-0}"
     TOTAL_STEPS=20
     WARMUP_STEPS=2
-    EXPECTED_NUM_TOKENS=1024
-    MAX_NUM_TOKENS=1280
-    MAX_NUM_TOKENS_PER_SAMPLE=768
+    EXPECTED_NUM_TOKENS=4096
+    MAX_NUM_TOKENS=8192
+    MAX_NUM_TOKENS_PER_SAMPLE=4096
+else
+    NUM_WORKERS="${NUM_WORKERS:-8}"
 fi
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--preflight-only)
@@ -93,19 +110,25 @@ if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/"* ]]
     fi
 fi
 
-if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml" ]]; then
-    EXPECTED_DATASET_FILES=(
-        text2image/local_256.parquet
-        text2video/local_128.parquet
-        image2image/local_256.parquet
-        video2video/local_64.parquet
-        image2text/local_256.parquet
-        video2text/local_256.parquet
-    )
-    for relative_path in "${EXPECTED_DATASET_FILES[@]}"; do
-        require_file "Lance example dataset" "${LANCE_DATASET_PATH}/${relative_path}"
-    done
-fi
+EXPECTED_DATASET_FILES=()
+case "${DATASET_CONFIG_FILE}" in
+    "${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml")
+        EXPECTED_DATASET_FILES=(
+            text2image/local_256.parquet
+            text2video/local_128.parquet
+            image2image/local_256.parquet
+            video2video/local_64.parquet
+            image2text/local_256.parquet
+            video2text/local_256.parquet
+        )
+        ;;
+    "${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml")
+        EXPECTED_DATASET_FILES=(text2image/local_256.parquet)
+        ;;
+esac
+for relative_path in "${EXPECTED_DATASET_FILES[@]}"; do
+    require_file "Lance example dataset" "${LANCE_DATASET_PATH}/${relative_path}"
+done
 
 # The released Lance VAE loader reads config/path_default.yaml instead of a CLI
 # argument. Expose the configured weight through its gitignored downloads path
@@ -119,7 +142,7 @@ elif [[ ! -f "${LANCE_WAN_VAE_PATH}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${TRAINING_MANIFEST}" || "${REGENERATE_TRAINING_MANIFEST:-0}" == "1" ]]; then
+if [[ "${TRAINING_MANIFEST_WAS_SET}" == "0" || ! -f "${TRAINING_MANIFEST}" || "${REGENERATE_TRAINING_MANIFEST:-0}" == "1" ]]; then
     python "${REPO_ROOT}/prepare_lance_training.py" \
         --stage pt \
         --init-mode qwen2_5_vl \
@@ -140,6 +163,7 @@ echo "Lance video checkpoint (not used by PT): ${LANCE_VIDEO_MODEL_PATH}"
 echo "Dataset root: ${DATASET_TREE_ROOT}"
 echo "Lance dataset view: ${LANCE_DATASET_PATH}"
 echo "Dataset config: ${DATASET_CONFIG_FILE}"
+echo "DataLoader workers per rank: ${NUM_WORKERS}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
 
 torchrun --nproc_per_node "${NPROC_PER_NODE}" \
@@ -170,11 +194,13 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --freeze_und_params false \
     --freeze_und false \
     --use_ema true \
-    --use_flex false \
+    --use_flex true \
     --cpu_offload false \
     --sharding_strategy HYBRID_SHARD \
     --backward_prefetch BACKWARD_PRE \
     --dataset_config_file "${DATASET_CONFIG_FILE}" \
+    --num_workers "${NUM_WORKERS}" \
+    --prefetch_factor "${PREFETCH_FACTOR}" \
     --total_steps "${TOTAL_STEPS}" \
     --warmup_steps "${WARMUP_STEPS}" \
     --lr 1e-4 \

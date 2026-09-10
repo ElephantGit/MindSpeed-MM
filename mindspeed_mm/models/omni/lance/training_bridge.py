@@ -474,7 +474,9 @@ def validate_forwarded_training_arguments(
         "freeze_und_params": False,
         "freeze_und": False,
         "use_ema": True,
-        "use_flex": False,
+        # On Ascend this selects Lance's compact SegmentedAttentionMask path;
+        # it does not invoke the CUDA/PyTorch FlexAttention kernel.
+        "use_flex": True,
         "cpu_offload": False,
     }
     checked_booleans = {}

@@ -74,7 +74,7 @@ def _paper_arguments(dataset: Path, init_path: Path):
         "--freeze_und_params", "false",
         "--freeze_und", "false",
         "--use_ema", "true",
-        "--use_flex", "false",
+        "--use_flex", "true",
         "--cpu_offload", "false",
         "--sharding_strategy", "HYBRID_SHARD",
         "--backward_prefetch", "BACKWARD_PRE",
