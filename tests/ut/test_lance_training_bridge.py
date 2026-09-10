@@ -11,6 +11,7 @@ from mindspeed_mm.models.omni.lance.training_bridge import (
     validate_training_manifest,
     validate_upstream_training_source,
 )
+from mindspeed_mm.models.omni.lance.native_config import LanceNativeConfig
 from mindspeed_mm.models.omni.lance.training_contract import STAGES, training_manifest
 from mindspeed_mm.models.omni.lance.upstream_training import (
     compile_strict_training_entrypoint,
@@ -34,6 +35,7 @@ def _prepared_manifest(tmp_path: Path, source: Path, init_mode: str = "qwen2_5_v
     init_path = tmp_path / "initialization"
     init_path.mkdir()
     manifest = training_manifest("pt", init_mode, world_size=8)
+    manifest["model"] = LanceNativeConfig.for_variant("video").to_dict()
     manifest["initialization"]["path"] = str(init_path) if init_mode != "random" else None
     manifest["dataset_manifests"] = [
         {
@@ -59,6 +61,9 @@ def _paper_arguments(dataset: Path, init_path: Path):
         "--layer_module", "Qwen2MoTDecoderLayer",
         "--vit_type", "qwen2_5_vl",
         "--vae_model_type", "wan",
+        "--max_num_frames", "121",
+        "--max_latent_size", "64",
+        "--latent_patch_size", "1", "1", "1",
         "--visual_gen", "true",
         "--visual_und", "true",
         "--freeze_vit", "true",
@@ -120,6 +125,21 @@ def test_forwarded_paper_arguments_match_manifest(tmp_path, monkeypatch):
     )
     assert result["status"] == "valid"
     assert not result["warnings"]
+
+
+def test_forwarded_arguments_require_model_geometry(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    source = _source_tree(tmp_path)
+    manifest, dataset, init_path = _prepared_manifest(tmp_path, source)
+    manifest_result = validate_training_manifest(manifest, source)
+    arguments = _paper_arguments(dataset, init_path)
+    patch_index = arguments.index("--latent_patch_size")
+    del arguments[patch_index:patch_index + 4]
+
+    result = validate_forwarded_training_arguments(arguments, manifest_result, source)
+
+    assert result["status"] == "invalid"
+    assert "critical upstream argument is missing: --latent_patch_size" in result["issues"]
 
 
 def test_smoke_test_allows_only_coherent_reductions(tmp_path, monkeypatch):

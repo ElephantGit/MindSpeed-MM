@@ -427,6 +427,42 @@ def validate_forwarded_training_arguments(
         elif actual != expected:
             issues.append("--{}={} differs from bridge contract {}".format(name, actual, expected))
 
+    model_contract = manifest.get("model")
+    checked_model_values = {}
+    if not isinstance(model_contract, Mapping):
+        issues.append("training manifest model contract is missing")
+    else:
+        for name in ("max_num_frames", "max_latent_size"):
+            expected = model_contract.get(name)
+            if not isinstance(expected, int) or isinstance(expected, bool):
+                issues.append("training manifest model.{} must be an integer".format(name))
+                continue
+            actual = _number_option(options, name, int, issues)
+            checked_model_values[name] = actual
+            if actual is not None and actual != expected:
+                issues.append("--{}={} differs from model contract {}".format(name, actual, expected))
+
+        expected_patch_size = model_contract.get("latent_patch_size")
+        patch_values = options.get("latent_patch_size")
+        actual_patch_size = None
+        if not isinstance(expected_patch_size, list) or len(expected_patch_size) != 3:
+            issues.append("training manifest model.latent_patch_size must contain three integers")
+        elif not patch_values:
+            issues.append("critical upstream argument is missing: --latent_patch_size")
+        else:
+            try:
+                actual_patch_size = [int(value) for value in patch_values]
+            except ValueError:
+                issues.append("upstream argument --latent_patch_size must contain integers")
+            else:
+                if actual_patch_size != expected_patch_size:
+                    issues.append(
+                        "--latent_patch_size={} differs from model contract {}".format(
+                            actual_patch_size, expected_patch_size
+                        )
+                    )
+        checked_model_values["latent_patch_size"] = actual_patch_size
+
     expected_booleans = {
         "visual_gen": True,
         "visual_und": True,
@@ -477,6 +513,7 @@ def validate_forwarded_training_arguments(
         "vit_path": str(vit_path) if vit_path is not None else None,
         "initialization_mode": init_mode,
         "checked_stage_values": checked_numbers,
+        "checked_model_values": checked_model_values,
         "checked_booleans": checked_booleans,
         "num_replicate": replicate,
         "num_shard": shard,
