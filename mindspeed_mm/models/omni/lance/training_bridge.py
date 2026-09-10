@@ -29,6 +29,9 @@ UPSTREAM_TRAINING_FILES = (
     "train/train_utils.py",
     "train/fsdp_utils.py",
     "data/dataset_base_train.py",
+    "data/data_utils.py",
+    "modeling/lance/lance.py",
+    "modeling/lance/qwen2_navit.py",
     "config/config_factory.py",
 )
 
@@ -474,8 +477,9 @@ def validate_forwarded_training_arguments(
         "freeze_und_params": False,
         "freeze_und": False,
         "use_ema": True,
-        # On Ascend this selects Lance's compact SegmentedAttentionMask path;
-        # it does not invoke the CUDA/PyTorch FlexAttention kernel.
+        # This keeps PackedDataset from materialising dense O(L^2) masks. The
+        # process-local Ascend runtime preserves the split metadata and routes
+        # the upstream FlexAttention call to segmented NPU fused attention.
         "use_flex": True,
         "cpu_offload": False,
     }

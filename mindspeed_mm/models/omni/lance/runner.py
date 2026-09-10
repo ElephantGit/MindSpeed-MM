@@ -1,5 +1,6 @@
 """Execution bridge from MindSpeed-MM to the released Lance source tree."""
 
+import importlib
 import os
 from pathlib import Path
 import runpy
@@ -100,18 +101,33 @@ def run_lance_entrypoint(
     if dry_run:
         return description
 
-    from .ascend_runtime import enable_lance_ascend_runtime
+    from .ascend_runtime import (
+        enable_lance_ascend_runtime,
+        patch_upstream_lance_training_attention,
+    )
 
-    runtime = enable_lance_ascend_runtime(execution_mode=execution_mode)
-    description["runtime"] = runtime.to_dict()
     original_argv = sys.argv[:]
     original_cwd = Path.cwd()
     inserted = str(source) not in sys.path
-    if inserted:
-        sys.path.insert(0, str(source))
     try:
-        sys.argv = [str(script)] + list(arguments)
+        if inserted:
+            sys.path.insert(0, str(source))
         os.chdir(str(source))
+        runtime = enable_lance_ascend_runtime(execution_mode=execution_mode)
+        description["runtime"] = runtime.to_dict()
+        if execution_mode == "training":
+            training_attention_runtime = patch_upstream_lance_training_attention(
+                importlib.import_module("torch_npu")
+            )
+            description["training_attention_runtime"] = training_attention_runtime
+            if os.environ.get("RANK", "0") == "0":
+                sys.stdout.write(
+                    "Lance training attention bridge: {} -> {}\n".format(
+                        training_attention_runtime["mask_backend"],
+                        training_attention_runtime["attention_backend"],
+                    )
+                )
+        sys.argv = [str(script)] + list(arguments)
         if compiled_entrypoint is None:
             runpy.run_path(str(script), run_name="__main__")
         else:

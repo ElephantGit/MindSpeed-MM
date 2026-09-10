@@ -213,6 +213,102 @@ def _patch_device_mesh() -> None:
     device_mesh.init_device_mesh = init_device_mesh
 
 
+def _device_type(value: Any) -> str:
+    device_type = getattr(value, "type", None)
+    if device_type is not None:
+        return str(device_type)
+    return str(value).split(":", 1)[0]
+
+
+def patch_upstream_lance_training_attention(torch_npu: Any) -> Dict[str, str]:
+    """Replace the released FlexAttention path inside this training process.
+
+    The source checkout stays untouched. ``modeling.lance.lance`` still owns
+    the mask semantics, while this hook preserves its input metadata before it
+    reaches ``create_block_mask`` and dispatches Qwen2-NaViT attention to the
+    Ascend fused TND kernel.
+    """
+
+    from .npu_attention import (
+        AscendKVCacheAttentionBackend,
+        UpstreamSegmentedAttentionMask,
+        run_upstream_flex_attention,
+    )
+
+    lance_module = importlib.import_module("modeling.lance.lance")
+    navit_module = importlib.import_module("modeling.lance.qwen2_navit")
+    current_sparse_mask = lance_module.create_sparse_mask
+    if getattr(current_sparse_mask, "_lance_npu_compatible", False):
+        return {
+            "status": "already-installed",
+            "mask_backend": "segmented-upstream-mask",
+            "attention_backend": "torch_npu.npu_fusion_attention:TND",
+        }
+
+    original_sparse_mask = current_sparse_mask
+    original_block_mask = lance_module.create_block_mask
+    original_flex_attention = navit_module.flex_attention
+    attention_backend = AscendKVCacheAttentionBackend(torch_npu_module=torch_npu)
+
+    def create_sparse_mask(
+        document_lens: Any,
+        split_lens: Any,
+        attn_modes: Any,
+        device: Any,
+    ) -> Any:
+        if _device_type(device) == "npu":
+            return UpstreamSegmentedAttentionMask.from_upstream(
+                document_lens,
+                split_lens,
+                attn_modes,
+            )
+        return original_sparse_mask(document_lens, split_lens, attn_modes, device)
+
+    def create_block_mask(mask_mod: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(mask_mod, UpstreamSegmentedAttentionMask):
+            return mask_mod
+        return original_block_mask(mask_mod, *args, **kwargs)
+
+    def flex_attention(
+        query: Any,
+        key: Any,
+        value: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        block_mask = kwargs.get("block_mask")
+        if isinstance(block_mask, UpstreamSegmentedAttentionMask):
+            if args:
+                raise RuntimeError("unexpected positional arguments in Lance FlexAttention bridge")
+            unsupported = set(kwargs) - {"block_mask", "enable_gqa"}
+            if unsupported:
+                raise RuntimeError(
+                    "unsupported Lance FlexAttention arguments: {}".format(
+                        ", ".join(sorted(unsupported))
+                    )
+                )
+            return run_upstream_flex_attention(
+                query,
+                key,
+                value,
+                block_mask,
+                attention_backend,
+            )
+        return original_flex_attention(query, key, value, *args, **kwargs)
+
+    create_sparse_mask._lance_npu_compatible = True
+    create_block_mask._lance_npu_compatible = True
+    flex_attention._lance_npu_compatible = True
+    lance_module.create_sparse_mask = create_sparse_mask
+    lance_module.create_block_mask = create_block_mask
+    navit_module.flex_attention = flex_attention
+    return {
+        "status": "installed",
+        "mask_backend": "segmented-upstream-mask",
+        "attention_backend": "torch_npu.npu_fusion_attention:TND",
+    }
+
+
 def enable_lance_ascend_runtime(execution_mode: str = "inference") -> LanceRuntimeInfo:
     """Install process-local compatibility hooks and return runtime metadata."""
 

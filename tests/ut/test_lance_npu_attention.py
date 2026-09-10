@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 
 import pytest
 
@@ -6,12 +8,17 @@ os.environ.setdefault("NON_MEGATRON", "true")
 
 torch = pytest.importorskip("torch")
 
+from mindspeed_mm.models.omni.lance.ascend_runtime import (
+    patch_upstream_lance_training_attention,
+)
 from mindspeed_mm.models.omni.lance.modeling_lance import reference_sdpa
 from mindspeed_mm.models.omni.lance.npu_attention import (
     AscendBlockAttentionBackend,
     AscendKVCacheAttentionBackend,
     AscendVisionAttentionBackend,
     LanceAscendAttentionError,
+    UpstreamSegmentedAttentionMask,
+    run_upstream_flex_attention,
 )
 from mindspeed_mm.models.omni.lance.sequence import (
     LanceDocument,
@@ -159,3 +166,73 @@ def test_kv_cache_backend_matches_non_equal_length_oracle(is_causal):
     assert call["actual_seq_kvlen"] == (8,)
     assert call["sparse_mode"] == (3 if is_causal else 0)
     assert (call["atten_mask"] is not None) is is_causal
+
+
+def test_upstream_segmented_flex_bridge_matches_sparse_mask_semantics():
+    FakeTorchNPU.calls = []
+    mask = UpstreamSegmentedAttentionMask.from_upstream(
+        document_lens=(7, 3),
+        split_lens=(2, 2, 2, 1, 1, 2),
+        attn_modes=("causal", "full", "noise", "causal", "causal", "full_noise"),
+    )
+    packed = LancePackedSequence(
+        (
+            LanceDocument(
+                "first",
+                (
+                    _segment(2, "causal"),
+                    _segment(2, "full", "vit"),
+                    _segment(2, "noise", "vae", "generation"),
+                    _segment(1, "causal"),
+                ),
+            ),
+            LanceDocument(
+                "second",
+                (
+                    _segment(1, "causal"),
+                    _segment(2, "full_noise", "clean_vae", "generation"),
+                ),
+            ),
+        )
+    )
+    torch.manual_seed(53)
+    query = torch.randn(1, 4, packed.length, 8)
+    key = torch.randn(1, 2, packed.length, 8)
+    value = torch.randn(1, 2, packed.length, 8)
+    expected = reference_sdpa(
+        query[0].transpose(0, 1),
+        key[0].transpose(0, 1),
+        value[0].transpose(0, 1),
+        torch.tensor(packed.dense_attention_mask(), dtype=torch.bool),
+    ).transpose(0, 1).unsqueeze(0)
+    backend = AscendKVCacheAttentionBackend(torch_npu_module=FakeTorchNPU)
+    actual = run_upstream_flex_attention(query, key, value, mask, backend)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert [call["sparse_mode"] for call in FakeTorchNPU.calls] == [3, 0, 0, 3, 3, 0]
+
+
+def test_training_runtime_intercepts_upstream_block_mask_without_editing_source(monkeypatch):
+    lance_module = types.ModuleType("modeling.lance.lance")
+    navit_module = types.ModuleType("modeling.lance.qwen2_navit")
+    lance_module.create_sparse_mask = lambda *args, **kwargs: "original-sparse-mask"
+    lance_module.create_block_mask = lambda *args, **kwargs: "original-block-mask"
+    navit_module.flex_attention = lambda *args, **kwargs: "original-flex-attention"
+    monkeypatch.setitem(sys.modules, "modeling.lance.lance", lance_module)
+    monkeypatch.setitem(sys.modules, "modeling.lance.qwen2_navit", navit_module)
+
+    result = patch_upstream_lance_training_attention(FakeTorchNPU)
+    mask = lance_module.create_sparse_mask(
+        (4,),
+        (2, 2),
+        ("causal", "full_noise"),
+        types.SimpleNamespace(type="npu"),
+    )
+
+    assert result["status"] == "installed"
+    assert isinstance(mask, UpstreamSegmentedAttentionMask)
+    assert mask.attn_modes == ("causal", "full")
+    assert lance_module.create_block_mask(mask) is mask
+    assert lance_module.create_sparse_mask((1,), (1,), ("causal",), "cpu") == (
+        "original-sparse-mask"
+    )
+    assert navit_module.flex_attention(None, None, None) == "original-flex-attention"
