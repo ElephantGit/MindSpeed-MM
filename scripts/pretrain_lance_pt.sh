@@ -19,6 +19,7 @@ WAN_VAE_PATH="${WAN_VAE_PATH:-${MODEL_ROOT}/Wan2.2_VAE.pth}"
 LANCE_IMAGE_MODEL_PATH="${LANCE_IMAGE_MODEL_PATH:-${MODEL_ROOT}/Lance_3B}"
 LANCE_VIDEO_MODEL_PATH="${LANCE_VIDEO_MODEL_PATH:-${MODEL_ROOT}/Lance_3B_Video}"
 DATASET_ROOT="${DATASET_ROOT:-/mnt/qs/datasets/bytedance-research/Lance_example_dataset/}"
+LOCAL_TRAIN_CONFIG_ROOT="${REPO_ROOT}/examples/lance/config/train_local"
 DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
@@ -41,6 +42,7 @@ MAX_NUM_TOKENS=50000
 MAX_NUM_TOKENS_PER_SAMPLE=40000
 VISUAL_GEN=true
 VISUAL_UND=true
+REQUIRE_UND_GEN=false
 ADAPTER_FLAGS=()
 
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
@@ -60,7 +62,21 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
             # count is greater than the generic 4096-token smoke limit.
             SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=10240
             ;;
-        */i2t_local.yaml|*/v2t_local.yaml|*/multi_und.yaml)
+        */pt_smoke.yaml)
+            # PT contains captioning and text/image/video generation, but not
+            # the edit samples from the released SFT-oriented unified YAML.
+            # Keep the paper PT context contract for its longest T2V samples.
+            MAX_NUM_TOKENS="${SMOKE_MAX_NUM_TOKENS:-50000}"
+            SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=40000
+            REQUIRE_UND_GEN=true
+            ;;
+        */v2t_local.yaml|*/multi_und.yaml)
+            # A two-second V2T clip can contribute roughly 5.3K merged ViT
+            # tokens before its prompt and labels are added.
+            SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=10240
+            VISUAL_GEN=false
+            ;;
+        */i2t_local.yaml)
             # Understanding-only batches contain VIT inputs and CE labels but
             # no VAE target. Upstream Lance must not enter its MSE branch.
             VISUAL_GEN=false
@@ -114,7 +130,8 @@ require_file "PackedDataset config" "${DATASET_CONFIG_FILE}"
 # their root or wrap them in one additional datasets/ directory.
 DATASET_TREE_ROOT="${DATASET_ROOT}"
 LANCE_DATASET_PATH="${LANCE_SOURCE_ROOT}/datasets"
-if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/"* ]]; then
+if [[ "${DATASET_CONFIG_FILE}" == "${LANCE_SOURCE_ROOT}/config/train_local/"* ||
+      "${DATASET_CONFIG_FILE}" == "${LOCAL_TRAIN_CONFIG_ROOT}/"* ]]; then
     require_directory "Lance example dataset" "${DATASET_ROOT}"
     if [[ ! -d "${DATASET_TREE_ROOT}/text2image" && -d "${DATASET_ROOT}/datasets/text2image" ]]; then
         DATASET_TREE_ROOT="${DATASET_ROOT}/datasets"
@@ -154,6 +171,14 @@ case "${DATASET_CONFIG_FILE}" in
         ;;
     "${LANCE_SOURCE_ROOT}/config/train_local/multi_und.yaml")
         EXPECTED_DATASET_FILES=(
+            image2text/local_256.parquet
+            video2text/local_256.parquet
+        )
+        ;;
+    "${LOCAL_TRAIN_CONFIG_ROOT}/pt_smoke.yaml")
+        EXPECTED_DATASET_FILES=(
+            text2image/local_256.parquet
+            text2video/local_128.parquet
             image2text/local_256.parquet
             video2text/local_256.parquet
         )
@@ -198,6 +223,7 @@ echo "Lance dataset view: ${LANCE_DATASET_PATH}"
 echo "Dataset config: ${DATASET_CONFIG_FILE}"
 echo "Visual generation: ${VISUAL_GEN}"
 echo "Visual understanding: ${VISUAL_UND}"
+echo "Require understanding and generation per batch: ${REQUIRE_UND_GEN}"
 echo "DataLoader workers per rank: ${NUM_WORKERS}"
 echo "Token budget: expected=${EXPECTED_NUM_TOKENS}, max=${MAX_NUM_TOKENS}, per-sample=${MAX_NUM_TOKENS_PER_SAMPLE}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
@@ -237,6 +263,7 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --dataset_config_file "${DATASET_CONFIG_FILE}" \
     --num_workers "${NUM_WORKERS}" \
     --prefetch_factor "${PREFETCH_FACTOR}" \
+    --require_und_gen "${REQUIRE_UND_GEN}" \
     --total_steps "${TOTAL_STEPS}" \
     --warmup_steps "${WARMUP_STEPS}" \
     --lr 1e-4 \
