@@ -18,7 +18,7 @@ VIT_PATH="${VIT_PATH:-${MODEL_ROOT}/Qwen2.5-VL-ViT}"
 WAN_VAE_PATH="${WAN_VAE_PATH:-${MODEL_ROOT}/Wan2.2_VAE.pth}"
 LANCE_IMAGE_MODEL_PATH="${LANCE_IMAGE_MODEL_PATH:-${MODEL_ROOT}/Lance_3B}"
 LANCE_VIDEO_MODEL_PATH="${LANCE_VIDEO_MODEL_PATH:-${MODEL_ROOT}/Lance_3B_Video}"
-DATASET_ROOT="${DATASET_ROOT:-/mnt/qs/dataset/bytedance-research/Lance_example_dataset/}"
+DATASET_ROOT="${DATASET_ROOT:-/mnt/qs/datasets/bytedance-research/Lance_example_dataset/}"
 DATASET_CONFIG_FILE="${DATASET_CONFIG_FILE:-${LANCE_SOURCE_ROOT}/config/train_local/unified.yaml}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_REPLICATE="${NUM_REPLICATE:-1}"
@@ -50,16 +50,23 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     fi
     TOTAL_STEPS=20
     WARMUP_STEPS=2
-    EXPECTED_NUM_TOKENS=4096
-    MAX_NUM_TOKENS=8192
-    MAX_NUM_TOKENS_PER_SAMPLE=4096
+    EXPECTED_NUM_TOKENS="${SMOKE_EXPECTED_NUM_TOKENS:-4096}"
+    MAX_NUM_TOKENS="${SMOKE_MAX_NUM_TOKENS:-10240}"
+    SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=4096
     case "${DATASET_CONFIG_FILE}" in
+        */i2i_local.yaml)
+            # A 768px I2I sample contains the source image twice (ViT and
+            # VAE conditioning) plus the target VAE latent. Its normal token
+            # count is greater than the generic 4096-token smoke limit.
+            SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=10240
+            ;;
         */i2t_local.yaml|*/v2t_local.yaml|*/multi_und.yaml)
             # Understanding-only batches contain VIT inputs and CE labels but
             # no VAE target. Upstream Lance must not enter its MSE branch.
             VISUAL_GEN=false
             ;;
     esac
+    MAX_NUM_TOKENS_PER_SAMPLE="${SMOKE_MAX_NUM_TOKENS_PER_SAMPLE:-${SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT}}"
 fi
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--preflight-only)
@@ -136,6 +143,9 @@ case "${DATASET_CONFIG_FILE}" in
     "${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml")
         EXPECTED_DATASET_FILES=(text2image/local_256.parquet)
         ;;
+    "${LANCE_SOURCE_ROOT}/config/train_local/i2i_local.yaml")
+        EXPECTED_DATASET_FILES=(image2image/local_256.parquet)
+        ;;
     "${LANCE_SOURCE_ROOT}/config/train_local/i2t_local.yaml")
         EXPECTED_DATASET_FILES=(image2text/local_256.parquet)
         ;;
@@ -189,6 +199,7 @@ echo "Dataset config: ${DATASET_CONFIG_FILE}"
 echo "Visual generation: ${VISUAL_GEN}"
 echo "Visual understanding: ${VISUAL_UND}"
 echo "DataLoader workers per rank: ${NUM_WORKERS}"
+echo "Token budget: expected=${EXPECTED_NUM_TOKENS}, max=${MAX_NUM_TOKENS}, per-sample=${MAX_NUM_TOKENS_PER_SAMPLE}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
 
 torchrun --nproc_per_node "${NPROC_PER_NODE}" \
