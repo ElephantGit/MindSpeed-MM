@@ -103,6 +103,7 @@ def run_lance_entrypoint(
 
     from .ascend_runtime import (
         enable_lance_ascend_runtime,
+        patch_upstream_lance_fsdp_optimizer_resume,
         patch_upstream_lance_training_attention,
     )
 
@@ -119,12 +120,20 @@ def run_lance_entrypoint(
             training_attention_runtime = patch_upstream_lance_training_attention(
                 importlib.import_module("torch_npu")
             )
+            optimizer_resume_runtime = patch_upstream_lance_fsdp_optimizer_resume()
             description["training_attention_runtime"] = training_attention_runtime
+            description["optimizer_resume_runtime"] = optimizer_resume_runtime
             if os.environ.get("RANK", "0") == "0":
                 sys.stdout.write(
                     "Lance training attention bridge: {} -> {}\n".format(
                         training_attention_runtime["mask_backend"],
                         training_attention_runtime["attention_backend"],
+                    )
+                )
+                sys.stdout.write(
+                    "Lance optimizer resume bridge: {} -> {}\n".format(
+                        optimizer_resume_runtime["save_format"],
+                        optimizer_resume_runtime["load_conversion"],
                     )
                 )
         sys.argv = [str(script)] + list(arguments)

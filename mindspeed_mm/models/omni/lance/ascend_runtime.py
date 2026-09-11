@@ -220,6 +220,85 @@ def _device_type(value: Any) -> str:
     return str(value).split(":", 1)[0]
 
 
+def patch_upstream_lance_fsdp_optimizer_resume() -> Dict[str, str]:
+    """Convert a saved FSDP optimizer state before the upstream load call.
+
+    Released Lance saves ``FSDP.optim_state_dict()`` under a sharded state-dict
+    context but restores it with a direct ``optimizer.load_state_dict()``.
+    A direct load leaves the saved sharded representation incompatible with
+    the optimizer's live local representation, so the first resumed Adam step
+    fails with mixed Tensor/DTensor foreach operands.  Keep the source checkout
+    untouched and apply PyTorch's required
+    ``FSDP.optim_state_dict_to_load()`` conversion immediately before the
+    released loader consumes the state.
+    """
+
+    fsdp_utils = importlib.import_module("train.fsdp_utils")
+    checkpoint_type = fsdp_utils.FSDPCheckpoint
+    current_loader = checkpoint_type.try_load_train_state
+    if getattr(current_loader, "_lance_npu_compatible", False):
+        return {
+            "status": "already-installed",
+            "save_format": "FSDP.optim_state_dict",
+            "load_conversion": "FSDP.optim_state_dict_to_load",
+        }
+
+    original_wrapper = fsdp_utils.fsdp_wrapper
+    model_holder: Dict[str, Any] = {"latest": None}
+
+    def fsdp_wrapper(*args: Any, **kwargs: Any) -> Any:
+        wrapped_model = original_wrapper(*args, **kwargs)
+        # The audited upstream entrypoint wraps EMA first and the trainable
+        # model second; optimizer-state loading follows immediately afterward.
+        model_holder["latest"] = wrapped_model
+        return wrapped_model
+
+    def try_load_train_state(
+        resume_from: Any,
+        optimizer: Any,
+        scheduler: Any,
+        fsdp_config: Any,
+    ) -> Any:
+        root_model = model_holder["latest"]
+        if resume_from is not None and root_model is None:
+            raise RuntimeError("Lance FSDP optimizer resume ran before model wrapping")
+
+        original_load_state_dict = optimizer.load_state_dict
+
+        def load_state_dict(optimizer_state_dict: Any) -> Any:
+            with fsdp_utils.FSDP.state_dict_type(
+                root_model,
+                fsdp_utils.StateDictType.SHARDED_STATE_DICT,
+                optim_state_dict_config=fsdp_utils.ShardedOptimStateDictConfig(
+                    offload_to_cpu=True
+                ),
+            ):
+                optimizer_state_dict = fsdp_utils.FSDP.optim_state_dict_to_load(
+                    root_model,
+                    optimizer,
+                    optimizer_state_dict,
+                )
+            return original_load_state_dict(optimizer_state_dict)
+
+        optimizer.load_state_dict = load_state_dict
+        try:
+            return current_loader(resume_from, optimizer, scheduler, fsdp_config)
+        finally:
+            # Remove the instance override so the optimizer class method is
+            # used normally for every subsequent operation.
+            del optimizer.load_state_dict
+
+    fsdp_wrapper._lance_npu_compatible = True
+    try_load_train_state._lance_npu_compatible = True
+    fsdp_utils.fsdp_wrapper = fsdp_wrapper
+    checkpoint_type.try_load_train_state = staticmethod(try_load_train_state)
+    return {
+        "status": "installed",
+        "save_format": "FSDP.optim_state_dict",
+        "load_conversion": "FSDP.optim_state_dict_to_load",
+    }
+
+
 def patch_upstream_lance_training_attention(torch_npu: Any) -> Dict[str, str]:
     """Replace the released FlexAttention path inside this training process.
 
