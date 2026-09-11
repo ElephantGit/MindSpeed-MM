@@ -363,6 +363,19 @@ PackedDataset 不生成 O(L²) dense mask；MindSpeed-MM 在训练进程内截�
 明确拒绝 `random` 初始化和 RL：官方入口没有严格随机初始化路径，且 `unified_train.py` 是监督训练
 循环。二者继续由原生 TrainEngine 路线实现。
 
+要覆盖 ViT、understanding expert 和 CE backward，可在 T2I smoke 通过后运行纯理解 smoke：
+
+```bash
+SMOKE_TEST=1 NUM_WORKERS=0 \
+DATASET_CONFIG_FILE=/mnt/qs/Lance/config/train_local/i2t_local.yaml \
+WANDB_NAME=lance-pt-i2t-smoke \
+bash scripts/pretrain_lance_pt.sh
+```
+
+对 `i2t_local.yaml`、`v2t_local.yaml` 和 `multi_und.yaml`，smoke 启动器会自动设置
+`visual_gen=false`。这些数据没有 VAE target；关闭 generation 分支可避免官方模型对空
+`padded_latent` 执行 MSE 前向。正式 PT 和生成类 smoke 仍保持 `visual_gen=true`。
+
 官方 `config/train_local/unified.yaml` 中的 `datasets/...` 是相对于 Lance checkout 的路径。启动脚本
 默认将 `/mnt/qs/datasets/bytedance-research/Lance_example_dataset` 映射为
 `/mnt/qs/Lance/datasets`，并在启动分布式进程前检查 unified 配置引用的六个 parquet。数据放在其他位置时

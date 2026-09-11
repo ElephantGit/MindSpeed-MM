@@ -39,6 +39,8 @@ WARMUP_STEPS=2500
 EXPECTED_NUM_TOKENS=44000
 MAX_NUM_TOKENS=50000
 MAX_NUM_TOKENS_PER_SAMPLE=40000
+VISUAL_GEN=true
+VISUAL_UND=true
 ADAPTER_FLAGS=()
 
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
@@ -51,6 +53,13 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     EXPECTED_NUM_TOKENS=4096
     MAX_NUM_TOKENS=8192
     MAX_NUM_TOKENS_PER_SAMPLE=4096
+    case "${DATASET_CONFIG_FILE}" in
+        */i2t_local.yaml|*/v2t_local.yaml|*/multi_und.yaml)
+            # Understanding-only batches contain VIT inputs and CE labels but
+            # no VAE target. Upstream Lance must not enter its MSE branch.
+            VISUAL_GEN=false
+            ;;
+    esac
 fi
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
     ADAPTER_FLAGS+=(--preflight-only)
@@ -127,6 +136,18 @@ case "${DATASET_CONFIG_FILE}" in
     "${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml")
         EXPECTED_DATASET_FILES=(text2image/local_256.parquet)
         ;;
+    "${LANCE_SOURCE_ROOT}/config/train_local/i2t_local.yaml")
+        EXPECTED_DATASET_FILES=(image2text/local_256.parquet)
+        ;;
+    "${LANCE_SOURCE_ROOT}/config/train_local/v2t_local.yaml")
+        EXPECTED_DATASET_FILES=(video2text/local_256.parquet)
+        ;;
+    "${LANCE_SOURCE_ROOT}/config/train_local/multi_und.yaml")
+        EXPECTED_DATASET_FILES=(
+            image2text/local_256.parquet
+            video2text/local_256.parquet
+        )
+        ;;
 esac
 for relative_path in "${EXPECTED_DATASET_FILES[@]}"; do
     require_file "Lance example dataset" "${LANCE_DATASET_PATH}/${relative_path}"
@@ -165,6 +186,8 @@ echo "Lance video checkpoint (not used by PT): ${LANCE_VIDEO_MODEL_PATH}"
 echo "Dataset root: ${DATASET_TREE_ROOT}"
 echo "Lance dataset view: ${LANCE_DATASET_PATH}"
 echo "Dataset config: ${DATASET_CONFIG_FILE}"
+echo "Visual generation: ${VISUAL_GEN}"
+echo "Visual understanding: ${VISUAL_UND}"
 echo "DataLoader workers per rank: ${NUM_WORKERS}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
 
@@ -186,8 +209,8 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --max_num_frames 121 \
     --max_latent_size 64 \
     --latent_patch_size 1 1 1 \
-    --visual_gen true \
-    --visual_und true \
+    --visual_gen "${VISUAL_GEN}" \
+    --visual_und "${VISUAL_UND}" \
     --freeze_vit true \
     --freeze_vae true \
     --freeze_llm false \

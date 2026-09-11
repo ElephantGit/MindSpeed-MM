@@ -174,6 +174,45 @@ def test_smoke_test_allows_only_coherent_reductions(tmp_path, monkeypatch):
     assert "smaller than --total_steps" in " ".join(incoherent["issues"])
 
 
+def test_understanding_only_smoke_requires_visual_generation_disabled(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    source = _source_tree(tmp_path)
+    manifest, dataset, init_path = _prepared_manifest(tmp_path, source)
+    i2t_dataset = dataset.with_name("i2t_local.yaml")
+    dataset.rename(i2t_dataset)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["dataset_manifests"][0] = {
+        "path": str(i2t_dataset),
+        "bytes": i2t_dataset.stat().st_size,
+        "sha256": sha256_file(i2t_dataset),
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    manifest_result = validate_training_manifest(manifest, source)
+
+    arguments = _paper_arguments(i2t_dataset, init_path)
+    strict_result = validate_forwarded_training_arguments(
+        arguments,
+        manifest_result,
+        source,
+        smoke_test=True,
+    )
+    assert strict_result["status"] == "invalid"
+    assert "--visual_gen=True differs from bridge contract False" in strict_result["issues"]
+
+    arguments[arguments.index("--visual_gen") + 1] = "false"
+    smoke_result = validate_forwarded_training_arguments(
+        arguments,
+        manifest_result,
+        source,
+        smoke_test=True,
+    )
+    assert smoke_result["status"] == "valid"
+    assert smoke_result["smoke_profile"] == "understanding-only"
+    assert "understanding-only smoke test overrides --visual_gen" in " ".join(
+        smoke_result["warnings"]
+    )
+
+
 def test_upstream_bridge_rejects_random_initialization(tmp_path, monkeypatch):
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     source = _source_tree(tmp_path)

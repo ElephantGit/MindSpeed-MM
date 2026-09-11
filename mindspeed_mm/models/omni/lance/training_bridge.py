@@ -24,6 +24,9 @@ class LanceTrainingBridgeError(ValueError):
 
 
 UPSTREAM_TRAINING_ENTRYPOINT = "train/unified_train.py"
+UNDERSTANDING_ONLY_SMOKE_CONFIGS = frozenset(
+    {"i2t_local.yaml", "v2t_local.yaml", "multi_und.yaml"}
+)
 UPSTREAM_TRAINING_FILES = (
     UPSTREAM_TRAINING_ENTRYPOINT,
     "train/train_utils.py",
@@ -466,8 +469,13 @@ def validate_forwarded_training_arguments(
                     )
         checked_model_values["latent_patch_size"] = actual_patch_size
 
+    understanding_only_smoke = (
+        smoke_test
+        and dataset_path is not None
+        and dataset_path.name in UNDERSTANDING_ONLY_SMOKE_CONFIGS
+    )
     expected_booleans = {
-        "visual_gen": True,
+        "visual_gen": not understanding_only_smoke,
         "visual_und": True,
         "freeze_vit": True,
         "freeze_vae": True,
@@ -489,6 +497,8 @@ def validate_forwarded_training_arguments(
         checked_booleans[name] = actual
         if actual is not None and actual is not expected:
             issues.append("--{}={} differs from bridge contract {}".format(name, actual, expected))
+        elif name == "visual_gen" and understanding_only_smoke and actual is False:
+            warnings.append("understanding-only smoke test overrides --visual_gen: True -> False")
 
     world_size = manifest_result["world_size"]
     environment_world_size = os.environ.get("WORLD_SIZE")
@@ -515,6 +525,7 @@ def validate_forwarded_training_arguments(
     return {
         "status": "valid" if not issues else "invalid",
         "smoke_test": smoke_test,
+        "smoke_profile": "understanding-only" if understanding_only_smoke else "joint",
         "dataset_config_file": str(dataset_path) if dataset_path is not None else None,
         "vit_path": str(vit_path) if vit_path is not None else None,
         "initialization_mode": init_mode,
