@@ -37,6 +37,11 @@ OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"
 WANDB_NAME="${WANDB_NAME:-lance-pt-ascend}"
 TOTAL_STEPS=350000
 WARMUP_STEPS=2500
+SAVE_EVERY="${SAVE_EVERY:-2000}"
+CKPT_DEBUG_STEPS="${CKPT_DEBUG_STEPS:--1}"
+AUTO_RESUME="${AUTO_RESUME:-false}"
+RESUME_MODEL_ONLY="${RESUME_MODEL_ONLY:-false}"
+LOAD_DATA_STATUS="${LOAD_DATA_STATUS:-false}"
 EXPECTED_NUM_TOKENS=44000
 MAX_NUM_TOKENS=50000
 MAX_NUM_TOKENS_PER_SAMPLE=40000
@@ -50,8 +55,8 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     if [[ "${DATASET_CONFIG_FILE_WAS_SET}" == "0" ]]; then
         DATASET_CONFIG_FILE="${LANCE_SOURCE_ROOT}/config/train_local/t2i_local.yaml"
     fi
-    TOTAL_STEPS=20
-    WARMUP_STEPS=2
+    TOTAL_STEPS="${SMOKE_TOTAL_STEPS:-20}"
+    WARMUP_STEPS="${SMOKE_WARMUP_STEPS:-2}"
     EXPECTED_NUM_TOKENS="${SMOKE_EXPECTED_NUM_TOKENS:-4096}"
     MAX_NUM_TOKENS="${SMOKE_MAX_NUM_TOKENS:-10240}"
     SMOKE_MAX_NUM_TOKENS_PER_SAMPLE_DEFAULT=4096
@@ -226,6 +231,7 @@ echo "Visual understanding: ${VISUAL_UND}"
 echo "Require understanding and generation per batch: ${REQUIRE_UND_GEN}"
 echo "DataLoader workers per rank: ${NUM_WORKERS}"
 echo "Token budget: expected=${EXPECTED_NUM_TOKENS}, max=${MAX_NUM_TOKENS}, per-sample=${MAX_NUM_TOKENS_PER_SAMPLE}"
+echo "Checkpoint: save-every=${SAVE_EVERY}, debug-step=${CKPT_DEBUG_STEPS}, auto-resume=${AUTO_RESUME}"
 echo "Training manifest: ${TRAINING_MANIFEST}"
 
 torchrun --nproc_per_node "${NPROC_PER_NODE}" \
@@ -266,6 +272,11 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" \
     --require_und_gen "${REQUIRE_UND_GEN}" \
     --total_steps "${TOTAL_STEPS}" \
     --warmup_steps "${WARMUP_STEPS}" \
+    --save_every "${SAVE_EVERY}" \
+    --ckpt_debug_steps "${CKPT_DEBUG_STEPS}" \
+    --auto_resume "${AUTO_RESUME}" \
+    --resume_model_only "${RESUME_MODEL_ONLY}" \
+    --load_data_status "${LOAD_DATA_STATUS}" \
     --lr 1e-4 \
     --lr_scheduler constant \
     --expected_num_tokens "${EXPECTED_NUM_TOKENS}" \

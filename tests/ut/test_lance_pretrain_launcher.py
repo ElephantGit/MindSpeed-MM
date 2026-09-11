@@ -139,3 +139,33 @@ def test_pt_smoke_uses_only_pt_modalities_and_paper_context_limits(tmp_path):
     config_text = config.read_text(encoding="utf-8")
     assert "datasets/image2image" not in config_text
     assert "datasets/video2video" not in config_text
+
+
+def test_pt_checkpoint_smoke_exposes_save_and_full_resume_controls(tmp_path):
+    config = REPO_ROOT / "examples" / "lance" / "config" / "train_local" / "pt_smoke.yaml"
+    result = _run_smoke(
+        tmp_path,
+        config_path=config,
+        dataset_relative_paths=(
+            "text2image/local_256.parquet",
+            "text2video/local_128.parquet",
+            "image2text/local_256.parquet",
+            "video2text/local_256.parquet",
+        ),
+        SMOKE_TOTAL_STEPS="10",
+        SMOKE_WARMUP_STEPS="1",
+        SAVE_EVERY="1000",
+        CKPT_DEBUG_STEPS="9",
+        AUTO_RESUME="true",
+        RESUME_MODEL_ONLY="false",
+        LOAD_DATA_STATUS="true",
+    )
+    arguments = result.stdout.splitlines()
+
+    assert _argument_value(arguments, "--total_steps") == "10"
+    assert _argument_value(arguments, "--warmup_steps") == "1"
+    assert _argument_value(arguments, "--save_every") == "1000"
+    assert _argument_value(arguments, "--ckpt_debug_steps") == "9"
+    assert _argument_value(arguments, "--auto_resume") == "true"
+    assert _argument_value(arguments, "--resume_model_only") == "false"
+    assert _argument_value(arguments, "--load_data_status") == "true"
