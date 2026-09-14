@@ -144,3 +144,36 @@ def test_qwen_file_initialization_streams_and_copies_generation(tmp_path):
     layer = model.language_model.model.layers[0]
     torch.testing.assert_close(layer.self_attn.q_proj.weight, source["model.layers.0.self_attn.q_proj.weight"])
     torch.testing.assert_close(layer.self_attn.q_proj_moe_gen.weight, layer.self_attn.q_proj.weight)
+
+
+def test_qwen_file_initialization_materializes_omitted_tied_lm_head(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    model = LanceNativeModel(_config())
+    qwen = tmp_path / "qwen"
+    qwen.mkdir()
+    (qwen / "config.json").write_text(
+        '{"tie_word_embeddings": true}', encoding="utf-8"
+    )
+    source = {}
+    for name, parameter in model.named_parameters():
+        if not name.startswith("language_model."):
+            continue
+        source_name = name.removeprefix("language_model.")
+        if (
+            source_name == "lm_head.weight"
+            or "_moe_gen" in source_name
+            or ".q_norm." in source_name
+            or ".k_norm." in source_name
+        ):
+            continue
+        source[source_name] = torch.full_like(parameter, 0.375)
+    safetensors.save_file(source, str(qwen / "model.safetensors"))
+
+    report = initialize_from_qwen_vl_files(model, qwen)
+
+    assert report["missing_required"] == []
+    assert report["tied_lm_head_source"]["source"] == "model.embed_tokens.weight"
+    torch.testing.assert_close(
+        model.language_model.lm_head.weight,
+        model.language_model.model.embed_tokens.weight,
+    )

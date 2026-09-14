@@ -134,6 +134,21 @@ def _safetensor_files(path: Union[str, Path]) -> Tuple[Path, ...]:
     return files
 
 
+def _qwen_uses_tied_word_embeddings(path: Union[str, Path]) -> bool:
+    """Return whether the source checkpoint intentionally omits a tied LM head."""
+
+    root = Path(path).expanduser().resolve()
+    config_path = (root if root.is_dir() else root.parent) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+    text_config = config.get("text_config")
+    if isinstance(text_config, Mapping) and "tie_word_embeddings" in text_config:
+        return text_config["tie_word_embeddings"] is True
+    return config.get("tie_word_embeddings") is True
+
+
 def _stream_safetensors(files: Iterable[Path]):
     try:
         from safetensors import safe_open
@@ -255,6 +270,34 @@ def initialize_from_qwen_vl_files(
                 }
                 del value
 
+        # Hugging Face does not serialize lm_head.weight for Qwen checkpoints
+        # whose config declares tied word embeddings.  Lance keeps the output
+        # head as an independent parameter, so materialize the tied source
+        # value into it before enforcing the complete-initialization contract.
+        embed_name = "language_model.model.embed_tokens.weight"
+        lm_head_name = "language_model.lm_head.weight"
+        tied_lm_head_source = None
+        if (
+            lm_head_name not in loaded
+            and embed_name in loaded
+            and _qwen_uses_tied_word_embeddings(qwen_path)
+        ):
+            embed = targets[embed_name]
+            lm_head = targets[lm_head_name]
+            if tuple(embed.shape) != tuple(lm_head.shape):
+                raise LanceInitializationError(
+                    "tied Qwen embedding and Lance LM head shapes do not match: {} != {}".format(
+                        tuple(embed.shape), tuple(lm_head.shape)
+                    )
+                )
+            lm_head.copy_(embed)
+            tied_lm_head_source = {
+                "source_kind": "qwen-tied-embedding",
+                "source": loaded[embed_name]["source"],
+                "file": loaded[embed_name]["file"],
+            }
+            loaded[lm_head_name] = tied_lm_head_source
+
     if shape_mismatches:
         raise LanceInitializationError(
             "Qwen2.5-VL initialization has {} shape mismatches; first: {}".format(
@@ -292,6 +335,7 @@ def initialize_from_qwen_vl_files(
         "unexpected": unexpected,
         "unexpected_count": len(unexpected),
         "generation_expert": expert_report,
+        "tied_lm_head_source": tied_lm_head_source,
         "streaming": True,
     }
 
