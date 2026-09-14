@@ -87,14 +87,22 @@ def _device():
 
 
 def _bucket_size(width, height, resolution, stride):
+    if isinstance(stride, (tuple, list)):
+        if len(stride) != 2:
+            raise ValueError("spatial stride must contain height and width factors")
+        height_stride, width_stride = (int(item) for item in stride)
+    else:
+        height_stride = width_stride = int(stride)
+    if height_stride <= 0 or width_stride <= 0:
+        raise ValueError("spatial stride factors must be positive")
     ratio = width / height
     target_ratio = min((w / h for w, h in ASPECT_RATIOS), key=lambda item: abs(item - ratio))
-    width_a = round((resolution * resolution * target_ratio) ** 0.5 / stride) * stride
-    height_a = round((width_a / target_ratio) / stride) * stride
-    height_b = round((resolution * resolution / target_ratio) ** 0.5 / stride) * stride
-    width_b = round((height_b * target_ratio) / stride) * stride
-    candidates = ((max(stride, width_a), max(stride, height_a)),
-                  (max(stride, width_b), max(stride, height_b)))
+    width_a = round((resolution * resolution * target_ratio) ** 0.5 / width_stride) * width_stride
+    height_a = round((width_a / target_ratio) / height_stride) * height_stride
+    height_b = round((resolution * resolution / target_ratio) ** 0.5 / height_stride) * height_stride
+    width_b = round((height_b * target_ratio) / width_stride) * width_stride
+    candidates = ((max(width_stride, width_a), max(height_stride, height_a)),
+                  (max(width_stride, width_b), max(height_stride, height_b)))
     return min(candidates, key=lambda item: (abs(item[0] / item[1] - target_ratio),
                                              abs(item[0] * item[1] - resolution * resolution)))
 
@@ -216,7 +224,12 @@ class FeatureEncoder:
         return embedding, tuple(int(item) for item in grid[0].tolist())
 
     def vae_encode(self, frames, *, resolution):
-        value = _transform(frames, resolution, 16, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        _, patch_h, patch_w = self.config.latent_patch_size
+        stride = (
+            self.vae.spatial_downsample * patch_h,
+            self.vae.spatial_downsample * patch_w,
+        )
+        value = _transform(frames, resolution, stride, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         if self.resample_posterior_during_training:
             return self.vae.encode_distribution((value,))[0]
         return self.vae.encode((value,))[0], None

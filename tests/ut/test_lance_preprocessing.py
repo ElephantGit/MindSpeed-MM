@@ -14,7 +14,7 @@ from mindspeed_mm.models.omni.lance.preprocessing import (
     build_understanding_sample,
     patchify_qwen_video,
 )
-from scripts.prepare_lance_native_data import _sample_video_indices
+from scripts.prepare_lance_native_data import _bucket_size, _sample_video_indices
 
 
 class _Tokenizer:
@@ -157,3 +157,23 @@ def test_video_sampling_matches_lance_multi_clip_kn_plus_one_contract():
     repeated = _sample_video_indices(5, 1, sample_fps=12, max_duration=6, temporal=4)
     assert len(repeated) == 57
     assert len(set(repeated)) < len(repeated)
+
+
+def test_vae_buckets_align_to_downsampled_latent_patch_geometry():
+    # A 16x VAE downsample followed by a 2x2 latent patch requires source
+    # dimensions divisible by 32.  The former scalar-16 buckets produced odd
+    # latent sides for most video aspect ratios.
+    for width, height in ((21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)):
+        bucket_width, bucket_height = _bucket_size(
+            width, height, resolution=640, stride=(32, 32)
+        )
+        assert bucket_height % 32 == 0
+        assert bucket_width % 32 == 0
+
+
+def test_vae_buckets_support_asymmetric_latent_patch_geometry():
+    bucket_width, bucket_height = _bucket_size(
+        16, 9, resolution=640, stride=(32, 64)
+    )
+    assert bucket_height % 32 == 0
+    assert bucket_width % 64 == 0
