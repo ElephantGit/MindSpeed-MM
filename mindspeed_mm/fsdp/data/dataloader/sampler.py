@@ -71,7 +71,7 @@ class BaseRandomBatchSampler(StatefulDistributedSampler):
             start_idx = self.rank * bucket_size
             if self.shuffle:
                 g = torch.Generator()
-                g.manual_seed(self.epoch)
+                g.manual_seed(self.seed + self.epoch)
                 idx_range_bucket = torch.randperm(bucket_size, generator=g).tolist()
             else:
                 idx_range_bucket = list(range(bucket_size))
@@ -82,7 +82,7 @@ class BaseRandomBatchSampler(StatefulDistributedSampler):
             full_bucket_offset = current_epoch_samples
             if self.shuffle:
                 g = torch.Generator()
-                g.manual_seed(self.epoch)
+                g.manual_seed(self.seed + self.epoch)
                 idx_range_total = \
                     torch.randperm(full_bucket_size, generator=g).tolist()
             else:

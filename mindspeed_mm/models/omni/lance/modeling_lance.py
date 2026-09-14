@@ -195,12 +195,6 @@ def _validate_routes(length: int, understanding: torch.Tensor, generation: torch
     combined = torch.cat((understanding, generation))
     if combined.numel() != length:
         raise ValueError("expert routes must cover every token exactly once")
-    if combined.numel() and (
-        int(combined.min().item()) < 0
-        or int(combined.max().item()) >= length
-        or int(torch.unique(combined).numel()) != length
-    ):
-        raise ValueError("expert routes contain duplicates or out-of-range indexes")
 
 
 class LanceMoTAttention(nn.Module):
@@ -244,12 +238,15 @@ class LanceMoTAttention(nn.Module):
         generation_projection: nn.Module,
         output_size: int,
     ) -> torch.Tensor:
+        understanding = understanding_projection(hidden_states[understanding_indexes])
+        generation = generation_projection(hidden_states[generation_indexes])
         output = hidden_states.new_empty((hidden_states.shape[0], output_size))
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_projection(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_projection(hidden_states[generation_indexes])
-        return output
+        # Execute both experts even for a zero-length local route.  This keeps
+        # their autograd participation symmetric when DP ranks carry different
+        # modalities and avoids conditional-expert FSDP reductions.
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     @staticmethod
     def _route_norm(
@@ -259,12 +256,12 @@ class LanceMoTAttention(nn.Module):
         understanding_norm: nn.Module,
         generation_norm: nn.Module,
     ) -> torch.Tensor:
+        understanding = understanding_norm(hidden_states[understanding_indexes])
+        generation = generation_norm(hidden_states[generation_indexes])
         output = torch.empty_like(hidden_states)
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_norm(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_norm(hidden_states[generation_indexes])
-        return output
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     def project_qkv(
         self,
@@ -428,12 +425,15 @@ class LanceMoTDecoderLayer(nn.Module):
         understanding_module: nn.Module,
         generation_module: nn.Module,
     ) -> torch.Tensor:
+        understanding = understanding_module(hidden_states[understanding_indexes])
+        generation = generation_module(hidden_states[generation_indexes])
         output = torch.empty_like(hidden_states)
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_module(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_module(hidden_states[generation_indexes])
-        return output
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        # Mixed-task data parallel ranks can have an empty local route.  Keep
+        # both independently wrapped FSDP2 experts in the autograd graph so
+        # every rank executes the same reduce-scatter sequence in backward.
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     def forward(
         self,

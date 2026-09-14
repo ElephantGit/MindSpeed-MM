@@ -152,6 +152,11 @@ class DistributedCheckpointer(CheckpointerBase):
             # EMA is model-sized sharded state and must not be duplicated into
             # each rank's small extra-state file.
             save_state["ema_model"] = ModelState(state["ema_model"])
+        if "ema_state" in state:
+            # Some native models keep EMA directly on local FSDP2 shards rather
+            # than allocating a second module tree.  The object implements the
+            # torch.distributed.checkpoint Stateful protocol itself.
+            save_state["ema_state"] = state["ema_state"]
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
@@ -207,6 +212,8 @@ class DistributedCheckpointer(CheckpointerBase):
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
         if not release and "ema_model" in state:
             load_state["ema_model"] = ModelState(state["ema_model"])
+        if not release and "ema_state" in state:
+            load_state["ema_state"] = state["ema_state"]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)

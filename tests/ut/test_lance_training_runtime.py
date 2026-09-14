@@ -18,6 +18,7 @@ from mindspeed_mm.models.omni.lance.training_runtime import (
     build_lance_optimizer,
     configure_lance_trainability,
 )
+from mindspeed_mm.models.omni.lance.training_lance import _resampled_timesteps
 
 
 def _config(variant="image"):
@@ -162,3 +163,17 @@ def test_eager_runtime_executes_optimizer_scheduler_and_ema_step():
     assert result["learning_rate"] == pytest.approx(stage.learning_rate)
     assert not torch.equal(before, model.vae2llm.weight)
     assert ema.num_updates == 2
+
+
+def test_runtime_timestep_sampling_groups_contiguous_target_visuals():
+    config = _config()
+    batch = _training_batch(config)
+    # Insert one clean condition VAE token between two target runs.
+    batch.vae_indexes = torch.tensor([1, 2, 4, 5])
+    batch.mse_indexes = torch.tensor([1, 2, 5])
+    batch.timesteps = torch.full((4,), 0.5)
+    torch.manual_seed(7)
+    values = _resampled_timesteps(batch)
+    assert values[0] == values[1]
+    assert values[2] == 0
+    assert 0 < values[3] < 1

@@ -103,17 +103,23 @@ class ModelHub:
         Returns:
             Configured model instance ready for training.
         """
-        try:
-            # Load HuggingFace Config
-            print_rank(logger.info, f"> Loading AutoConfig from {model_args.model_name_or_path}...")
-            transformer_config = AutoConfig.from_pretrained(
-                model_args.model_name_or_path,
-                trust_remote_code=model_args.trust_remote_code,
-                _attn_implementation=model_args.attn_implementation
-            )
-        except Exception as e:
-            # If config loading fails, treat as custom model
+        if bool(getattr(model_args, "native_config_only", False)):
+            # Explicitly native models own their configuration and must not
+            # trigger an accidental Hugging Face/network lookup for a missing
+            # model_name_or_path.
             transformer_config = None
+        else:
+            try:
+                # Load HuggingFace Config
+                print_rank(logger.info, f"> Loading AutoConfig from {model_args.model_name_or_path}...")
+                transformer_config = AutoConfig.from_pretrained(
+                    model_args.model_name_or_path,
+                    trust_remote_code=model_args.trust_remote_code,
+                    _attn_implementation=model_args.attn_implementation
+                )
+            except Exception:
+                # If config loading fails, treat as custom model
+                transformer_config = None
 
         # Determine which builder to use based on config availability
         if transformer_config:

@@ -41,6 +41,7 @@ class LanceTrainingBatch:
 
     vae_indexes: Optional[torch.Tensor] = None
     clean_latents: Optional[torch.Tensor] = None
+    latent_log_variance: Optional[torch.Tensor] = None
     latent_position_ids: Optional[torch.Tensor] = None
     timesteps: Optional[torch.Tensor] = None
     noise: Optional[torch.Tensor] = None
@@ -52,10 +53,28 @@ class LanceTrainingBatch:
     ce_labels: Optional[torch.Tensor] = None
     ce_weights: Optional[torch.Tensor] = None
     mse_indexes: Optional[torch.Tensor] = None
+    # Pre-encoded datasets store target/condition sentinels and request fresh
+    # per-visual timesteps from the accelerator RNG at each training visit.
+    resample_timesteps: bool = False
 
     @property
     def sequence_length(self) -> int:
         return int(self.token_ids.numel())
+
+    def pin_memory(self):
+        """Pin tensor payloads when a DataLoader requests host staging.
+
+        PyTorch's generic pin-memory walker does not recurse into dataclasses.
+        Keeping this method on the batch contract enables non-blocking H2D
+        copies without teaching the common MindSpeed-MM loader about Lance.
+        Compact attention metadata is immutable Python state and needs no pin.
+        """
+
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(self, name, value.pin_memory())
+        return self
 
     def validate(self, model: LanceNativeModel) -> None:
         length = self.sequence_length
@@ -83,8 +102,18 @@ class LanceTrainingBatch:
         vae_fields = (self.vae_indexes, self.clean_latents, self.latent_position_ids, self.timesteps)
         if any(field is not None for field in vae_fields) and not all(field is not None for field in vae_fields):
             raise LanceTrainingError("VAE indexes, latents, positions, and timesteps must be provided together")
+        if self.vae_indexes is None and (
+            self.noise is not None or self.latent_log_variance is not None
+        ):
+            raise LanceTrainingError("VAE noise/posterior tensors require VAE indexes")
         if self.vae_indexes is not None:
             _validate_indexes("VAE", self.vae_indexes, length)
+            if self.vae_indexes.numel() > 1 and torch.any(
+                self.vae_indexes[1:] <= self.vae_indexes[:-1]
+            ):
+                raise LanceTrainingError(
+                    "VAE indexes must be strictly increasing for compact latent lookup"
+                )
             count = self.vae_indexes.numel()
             if self.clean_latents.shape != (count, patch_dim):
                 raise LanceTrainingError("clean_latents shape does not match VAE token count")
@@ -92,6 +121,11 @@ class LanceTrainingBatch:
                 raise LanceTrainingError("latent positions/timesteps must match VAE token count")
             if self.noise is not None and self.noise.shape != self.clean_latents.shape:
                 raise LanceTrainingError("noise shape must match clean_latents")
+            if (
+                self.latent_log_variance is not None
+                and self.latent_log_variance.shape != self.clean_latents.shape
+            ):
+                raise LanceTrainingError("latent_log_variance must match clean_latents")
 
         if (self.vit_indexes is None) != (self.vit_embeddings is None):
             raise LanceTrainingError("ViT indexes and embeddings must be provided together")
@@ -131,22 +165,51 @@ def _validate_indexes(name: str, indexes: torch.Tensor, length: int) -> None:
         raise LanceTrainingError("{} indexes contain duplicates or out-of-range values".format(name))
 
 
-def shift_timesteps(timesteps: torch.Tensor, shift: float) -> torch.Tensor:
+def shift_timesteps(
+    timesteps: torch.Tensor, shift: float, *, validate: bool = True
+) -> torch.Tensor:
     if shift <= 0:
         raise LanceTrainingError("timestep shift must be positive")
-    if torch.any(timesteps < 0) or torch.any(timesteps > 1):
+    if validate and (torch.any(timesteps < 0) or torch.any(timesteps > 1)):
         raise LanceTrainingError("timesteps must be in [0, 1]")
     return shift * timesteps / (1.0 + (shift - 1.0) * timesteps)
 
 
-def _distributed_average(local_sum: torch.Tensor, local_weight: torch.Tensor) -> torch.Tensor:
+def _resampled_timesteps(batch: LanceTrainingBatch) -> torch.Tensor:
+    """Sample one sigmoid-normal value for each contiguous target visual span."""
+
+    result = torch.zeros_like(batch.timesteps)
+    if batch.mse_indexes is None or not batch.mse_indexes.numel():
+        return result
+    # Prepared batches encode condition spans as zero and target spans with a
+    # positive sentinel.  This avoids a large/slow torch.isin operation on NPU.
+    selected = batch.timesteps > 0
+    previous_contiguous = torch.zeros_like(selected)
+    previous_contiguous[1:] = selected[:-1] & (
+        batch.vae_indexes[1:] == batch.vae_indexes[:-1] + 1
+    )
+    starts = selected & ~previous_contiguous
+    group_ids = starts.long().cumsum(0) - 1
+    group_count = int(starts.sum().item())
+    values = torch.sigmoid(
+        torch.randn(group_count, device=result.device, dtype=torch.float32)
+    ).to(result.dtype)
+    result[selected] = values[group_ids[selected]]
+    return result
+
+
+def _distributed_average(
+    local_sum: torch.Tensor,
+    local_weight: torch.Tensor,
+    process_group=None,
+) -> Optional[torch.Tensor]:
     denominator = local_weight.detach().clone().to(device=local_sum.device, dtype=torch.float32)
     world_size = 1
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
-        world_size = dist.get_world_size()
+        dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=process_group)
+        world_size = dist.get_world_size(group=process_group)
     if float(denominator.item()) <= 0:
-        raise LanceTrainingError("global loss denominator must be positive")
+        return None
     return local_sum * world_size / denominator
 
 
@@ -155,10 +218,14 @@ def lance_training_step(
     batch: LanceTrainingBatch,
     loss_weights: LanceLossWeights,
     timestep_shift: float,
+    *,
+    validate: bool = True,
+    data_parallel_group=None,
 ) -> Dict[str, Optional[torch.Tensor]]:
     """Run one joint understanding/generation step on a packed sequence."""
 
-    batch.validate(model)
+    if validate:
+        batch.validate(model)
     embedded_tokens = model.language_model.model.embed_tokens(batch.token_ids)
     hidden_inputs = embedded_tokens.new_zeros((batch.sequence_length, model.config.hidden_size))
     hidden_inputs[batch.text_indexes] = embedded_tokens[batch.text_indexes]
@@ -168,20 +235,40 @@ def lance_training_step(
 
     velocity_target = None
     shifted_timesteps = None
+    bridge_guard = hidden_inputs.sum() * 0.0
     if batch.vae_indexes is not None:
-        noise = batch.noise if batch.noise is not None else torch.randn_like(batch.clean_latents)
-        shifted_timesteps = shift_timesteps(batch.timesteps, timestep_shift)
+        clean_latents = batch.clean_latents
+        if batch.latent_log_variance is not None:
+            clean_latents = clean_latents + torch.exp(
+                0.5 * batch.latent_log_variance
+            ) * torch.randn_like(clean_latents)
+        noise = batch.noise if batch.noise is not None else torch.randn_like(clean_latents)
+        raw_timesteps = _resampled_timesteps(batch) if batch.resample_timesteps else batch.timesteps
+        shifted_timesteps = shift_timesteps(
+            raw_timesteps, timestep_shift, validate=validate
+        )
         noisy_latents = (
-            (1.0 - shifted_timesteps.unsqueeze(1)) * batch.clean_latents
+            (1.0 - shifted_timesteps.unsqueeze(1)) * clean_latents
             + shifted_timesteps.unsqueeze(1) * noise
         )
-        velocity_target = noise - batch.clean_latents
+        velocity_target = noise - clean_latents
         latent_embedding = (
             model.vae2llm(noisy_latents)
             + model.time_embedder(shifted_timesteps)
             + model.latent_pos_embed(batch.latent_position_ids)
         )
         hidden_inputs[batch.vae_indexes] = latent_embedding.to(hidden_inputs.dtype)
+    else:
+        # vae2llm and time_embedder are separate FSDP2 units.  All ranks call
+        # them in a fixed order even if this rank contains only understanding
+        # samples, otherwise mixed-modality data can deadlock collectives.
+        empty_latents = hidden_inputs.new_empty((0, model.config.patch_latent_dim))
+        empty_timesteps = hidden_inputs.new_empty((0,), dtype=torch.float32)
+        bridge_guard = (
+            model.vae2llm(empty_latents).sum()
+            + model.time_embedder(empty_timesteps).sum()
+            + model.latent_pos_embed(batch.token_ids.new_empty((0,))).sum()
+        ) * 0.0
 
     hidden_states = model.forward_language(
         hidden_inputs,
@@ -191,25 +278,57 @@ def lance_training_step(
         batch.generation_indexes,
     )
 
-    ce_loss = None
+    # Every rank participates in both denominator collectives.  Real mixed
+    # batches may contain only CE or only MSE tokens on one rank; conditionally
+    # entering these all-reduces would deadlock FSDP data parallelism.
+    empty_indexes = batch.token_ids.new_empty((0,))
+    selected_ce = batch.ce_indexes if batch.ce_indexes is not None else empty_indexes
+    # lm_head is also wrapped independently and therefore cannot be skipped on
+    # ranks whose local packed sequence has no understanding target.
+    logits = model.language_model.lm_head(hidden_states[selected_ce])[
+        ..., :getattr(model, "effective_vocab_size", model.config.vocab_size)
+    ]
+    ce_sum = logits.sum() * 0.0
+    ce_weight = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
     if batch.ce_indexes is not None and batch.ce_indexes.numel():
-        logits = model.language_model.lm_head(hidden_states[batch.ce_indexes])
-        per_token_ce = F.cross_entropy(logits.float(), batch.ce_labels, reduction="none")
-        ce_sum = (per_token_ce * batch.ce_weights.float()).sum()
-        ce_loss = _distributed_average(ce_sum, batch.ce_weights.float().sum())
-
-    mse_loss = None
-    if batch.mse_indexes is not None and batch.mse_indexes.numel():
-        predictions = model.llm2vae(hidden_states[batch.mse_indexes])
-        global_targets = predictions.new_zeros((batch.sequence_length, model.config.patch_latent_dim))
-        global_targets[batch.vae_indexes] = velocity_target.to(predictions.dtype)
-        per_token_mse = (predictions.float() - global_targets[batch.mse_indexes].float()).pow(2).mean(dim=-1)
-        mse_loss = _distributed_average(
-            per_token_mse.sum(),
-            torch.tensor(per_token_mse.numel(), device=per_token_mse.device, dtype=torch.float32),
+        # The native model keeps the checkpoint's padded embedding table but
+        # trains only the tokenizer's real vocabulary.  Match Lance by masking
+        # padded/out-of-range labels instead of passing them to cross_entropy.
+        valid_labels = (
+            (batch.ce_labels >= 0)
+            & (batch.ce_labels < logits.shape[-1])
         )
+        safe_labels = torch.where(
+            valid_labels, batch.ce_labels, torch.zeros_like(batch.ce_labels)
+        )
+        valid_weights = batch.ce_weights.float() * valid_labels.float()
+        per_token_ce = F.cross_entropy(logits.float(), safe_labels, reduction="none")
+        ce_sum = (per_token_ce * valid_weights).sum()
+        ce_weight = valid_weights.sum()
+    ce_loss = _distributed_average(ce_sum, ce_weight, data_parallel_group)
 
-    total_loss = hidden_states.sum() * 0.0
+    selected_mse = batch.mse_indexes if batch.mse_indexes is not None else empty_indexes
+    # The latent output head follows the same cross-rank call-order rule.
+    predictions = model.llm2vae(hidden_states[selected_mse])
+    mse_sum = predictions.sum() * 0.0
+    mse_weight = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+    if batch.mse_indexes is not None and batch.mse_indexes.numel():
+        # VAE indexes are monotonically packed.  Map selected global sequence
+        # positions into the compact latent tensor instead of allocating a
+        # [sequence_length, latent_width] scratch buffer every step.
+        latent_indexes = torch.searchsorted(batch.vae_indexes, batch.mse_indexes)
+        target = velocity_target[latent_indexes]
+        per_token_mse = (predictions.float() - target.float()).pow(2).mean(dim=-1)
+        mse_sum = per_token_mse.sum()
+        mse_weight = torch.tensor(
+            per_token_mse.numel(), device=per_token_mse.device, dtype=torch.float32
+        )
+    mse_loss = _distributed_average(mse_sum, mse_weight, data_parallel_group)
+
+    # ce_sum/mse_sum carry zero-valued graph edges when the corresponding
+    # modality is globally absent.  Retaining those edges is required for
+    # FSDP2's wrapped LM/latent heads to participate in every backward pass.
+    total_loss = hidden_states.sum() * 0.0 + bridge_guard + ce_sum * 0.0 + mse_sum * 0.0
     if ce_loss is not None:
         total_loss = total_loss + loss_weights.ce * ce_loss
     if mse_loss is not None:

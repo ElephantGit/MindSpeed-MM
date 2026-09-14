@@ -33,14 +33,24 @@ class FakeTorchNPU:
     @classmethod
     def npu_fusion_attention(cls, query, key, value, **kwargs):
         cls.calls.append(kwargs)
-        q_length, kv_length = query.shape[0], key.shape[0]
-        if kwargs["sparse_mode"] == 3:
-            row = torch.arange(q_length).unsqueeze(1)
-            column = torch.arange(kv_length).unsqueeze(0)
-            mask = column <= row + (kv_length - q_length)
-        else:
-            mask = torch.ones(q_length, kv_length, dtype=torch.bool)
-        return (reference_sdpa(query, key, value, mask),)
+        outputs = []
+        q_start = kv_start = 0
+        for q_end, kv_end in zip(
+            kwargs["actual_seq_qlen"], kwargs["actual_seq_kvlen"]
+        ):
+            query_part = query[q_start:q_end]
+            key_part = key[kv_start:kv_end]
+            value_part = value[kv_start:kv_end]
+            q_length, kv_length = query_part.shape[0], key_part.shape[0]
+            if kwargs["sparse_mode"] == 3:
+                row = torch.arange(q_length).unsqueeze(1)
+                column = torch.arange(kv_length).unsqueeze(0)
+                mask = column <= row + (kv_length - q_length)
+            else:
+                mask = torch.ones(q_length, kv_length, dtype=torch.bool)
+            outputs.append(reference_sdpa(query_part, key_part, value_part, mask))
+            q_start, kv_start = q_end, kv_end
+        return (torch.cat(outputs),)
 
 
 def _segment(length, mode, modality="text", expert="understanding"):
@@ -79,9 +89,10 @@ def test_block_scheduled_npu_calls_equal_dense_attention_oracle():
     actual = backend(query, key, value, None)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
-    assert len(FakeTorchNPU.calls) == 6
-    assert [call["sparse_mode"] for call in FakeTorchNPU.calls] == [3, 0, 0, 3, 3, 0]
-    assert FakeTorchNPU.calls[3]["actual_seq_kvlen"] == (5,)
+    assert len(FakeTorchNPU.calls) == 2
+    assert [call["sparse_mode"] for call in FakeTorchNPU.calls] == [3, 0]
+    assert FakeTorchNPU.calls[0]["actual_seq_qlen"] == (2, 3, 4)
+    assert FakeTorchNPU.calls[0]["actual_seq_kvlen"] == (2, 7, 8)
     assert all(call["input_layout"] == "TND" for call in FakeTorchNPU.calls)
 
 

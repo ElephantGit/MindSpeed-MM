@@ -10,6 +10,7 @@ from mindspeed_mm.models.omni.lance.initialization import (
     LanceInitializationError,
     copy_understanding_to_generation,
     initialize_from_qwen_vl_state_dict,
+    initialize_from_qwen_vl_files,
     initialize_random,
     load_native_lance_checkpoint,
     qwen_vl_target_name,
@@ -123,3 +124,23 @@ def test_native_checkpoint_loader_refuses_meta_destination(tmp_path):
     target = LanceNativeModel(_config(), device="meta", dtype=torch.bfloat16)
     with pytest.raises(LanceInitializationError, match="materialized"):
         load_native_lance_checkpoint(target, checkpoint)
+
+
+def test_qwen_file_initialization_streams_and_copies_generation(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    model = LanceNativeModel(_config())
+    qwen = tmp_path / "qwen"
+    qwen.mkdir()
+    source = {
+        "model.layers.0.self_attn.q_proj.weight": torch.full((32, 32), 0.375),
+        "model.embed_tokens.weight": torch.full((31, 32), 0.25),
+    }
+    safetensors.save_file(source, str(qwen / "model.safetensors"))
+    report = initialize_from_qwen_vl_files(
+        model, qwen, require_complete=False
+    )
+    assert report["streaming"] is True
+    assert report["loaded_count"] == 2
+    layer = model.language_model.model.layers[0]
+    torch.testing.assert_close(layer.self_attn.q_proj.weight, source["model.layers.0.self_attn.q_proj.weight"])
+    torch.testing.assert_close(layer.self_attn.q_proj_moe_gen.weight, layer.self_attn.q_proj.weight)

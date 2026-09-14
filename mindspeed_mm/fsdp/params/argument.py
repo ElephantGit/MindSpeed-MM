@@ -48,7 +48,10 @@ def parse_args(dataclass_type: Arguments):
             f"Expected a YAML file with extension .yaml or .yml\n"
         )
     with open(os.path.abspath(cmd_args[0]), encoding="utf-8") as f:
-        input_data: Dict[str, Dict[str, Any]] = yaml.safe_load(f)
+        # Training examples commonly live in containers whose checkpoint and
+        # dataset roots differ.  Expanding ${NAME} keeps one reviewed config
+        # while launch scripts supply only deployment-specific absolute paths.
+        input_data: Dict[str, Dict[str, Any]] = yaml.safe_load(os.path.expandvars(f.read()))
 
     # Instantiate the Arguments dataclass from YAML data
     args = instantiate_dataclass(dataclass_type, input_data)

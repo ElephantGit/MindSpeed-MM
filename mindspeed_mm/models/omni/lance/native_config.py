@@ -139,6 +139,28 @@ class LanceNativeConfig:
         )
         return result
 
+    def with_overrides(self, **updates: Any) -> "LanceNativeConfig":
+        """Return a validated config with explicit shape-bearing overrides.
+
+        Initialization, media preprocessing, packing, preflight, and training
+        all call this helper.  Keeping the normalization here prevents a YAML
+        list and a CLI tuple from producing subtly different contracts.
+        """
+
+        allowed = set(self.__dataclass_fields__)
+        unknown = sorted(set(updates) - allowed)
+        if unknown:
+            raise LanceConfigError(
+                "unknown native Lance configuration fields: {}".format(
+                    ", ".join(unknown)
+                )
+            )
+        normalized = dict(updates)
+        for name in ("mrope_section", "latent_patch_size", "vit_fullatt_block_indexes"):
+            if name in normalized:
+                normalized[name] = tuple(int(item) for item in normalized[name])
+        return replace(self, **normalized)
+
     @classmethod
     def for_variant(cls, variant: str) -> "LanceNativeConfig":
         if variant == "image":

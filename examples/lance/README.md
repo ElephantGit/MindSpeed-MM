@@ -1,9 +1,175 @@
-# Lance 昇腾推理与评测（第一阶段）
+# Lance on MindSpeed-MM
+
+## 原生 FSDP2 预训练（`codex/lance-native-mindspeed-training`）
+
+本分支新增的预训练路径是 MindSpeed-MM 原生实现，不是 Lance 官方仓库的启动桥：模型注册、MoT
+forward/backward、数据集、FSDP2、融合 AdamW、梯度裁剪、EMA、DCP 保存/恢复均在
+`mindspeed_mm` 内执行。训练命令不会发现、导入或运行 Lance 官方 Git checkout。
+
+为避免每个 epoch、每个 data-parallel rank 重复运行冻结编码器，示例 parquet 先离线执行 Qwen
+ViT 和 48-channel Wan2.2 VAE 编码，再按论文的 44K--50K token budget 打包。训练进程只常驻
+Lance 的可训练 MoT core、bridge/head 和 connector；冻结 ViT、VAE、3D position table 不进入
+optimizer 或 EMA。
+
+原生 sample builder 使用 Lance/Qwen 的 system-user-assistant 模板、`<|video_pad|>` 视觉展开和
+assistant-only CE 范围。VAE 离线保存 posterior mean/log-variance，训练每次访问重新采样 latent、
+sigmoid-normal timestep 和 flow noise；不是把某一次离线随机结果重复 350K steps。不同模态 rank
+即使本地 CE、MSE、ViT 或 VAE token 为空，也会以零长度输入进入相同的 FSDP2 wrapped module，
+避免 mixed-task 训练时 collective 顺序分叉。
+
+位置编码按 Qwen2.5-VL 的三轴 MRoPE 生成：ViT 使用 merger 后网格与 temporal stride 2，Lance
+MaPE 把语义 ViT 条件移到 temporal band 1000；I2I/V2V 的 noisy target 复用对应 clean VAE 条件
+的位置。视频抽帧也按官方 `MultiClipsFrameSampler(assert_seconds=false, truncate=false)` 在完整视频
+范围均匀采样，短低帧率视频允许重复帧，以保持 `kn+1` 时间长度契约。
+
+### 1. 原生运行时 smoke
+
+以下命令使用 tiny Lance，但会真实执行 joint CE+MSE 前向、反向、FSDP2 参数更新、EMA 和 DCP：
+
+```bash
+NATIVE_SMOKE_TEST=1 NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+```
+
+该 smoke 只验证训练引擎和分布式图，不代表真实 tokenizer、初始化权重和媒体编码已经验收。
+`outputs/lance-native-synthetic` 必须是新的输出路径；可用 `LANCE_SYNTHETIC_OUTPUT` 指向另一个目录。
+
+### 2. 准备 Qwen 初始化 DCP 与 350K 示例数据
+
+脚本已写入当前机器的默认路径：
+
+```text
+Qwen:   /mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct
+ViT:    /mnt/qs/models/bytedance-research/Lance/Qwen2.5-VL-ViT
+VAE:    /mnt/qs/models/bytedance-research/Lance/Wan2.2_VAE.pth
+Data:   /mnt/qs/datasets/bytedance-research/Lance_example_dataset
+```
+
+分阶段执行便于失败后定位；每个输出目录都拒绝覆盖非空内容：
+
+```bash
+bash scripts/prepare_lance_native_pt.sh init
+NPROC_PER_NODE=8 bash scripts/prepare_lance_native_pt.sh encode
+bash scripts/prepare_lance_native_pt.sh pack
+```
+
+`init` 流式读取 Qwen safetensors，初始化 understanding expert，再复制到 generation expert，最后
+直接写 MindSpeed-MM release DCP。`encode` 原生识别示例 parquet 中的 T2I/T2V、I2T/V2T、
+I2I/V2V schema，并把各 rank 结果写到独立目录。`pack` 在 40K 单样本上限下生成 44K--50K
+Ascend packed sequences；过长样本只在 manifest 中明确计数，不会出现训练时无限 `skip`。
+
+原生 PT 默认显式使用 `latent_patch_size=1 2 2`，对应官方 PT 配置的空间 latent patching；这是让
+V2V 示例保持在 40K 单样本上限内的必要配置。初始化、预编码、packing 和训练会使用同一几何契约。
+如果要做发布 checkpoint 的 `1 1 1` 结构实验，必须在所有命令中同时设置
+`LANCE_LATENT_PATCH_H=1 LANCE_LATENT_PATCH_W=1`，且 packer 会在某个必需任务全部超长时直接失败，
+不会悄悄丢掉整个任务。
+
+先做少量真实数据 smoke 时，不要占用完整数据输出目录：
+
+```bash
+LANCE_PREPARED_SAMPLES=datasets/lance-prepared-smoke \
+LANCE_PREENCODED_DATA=datasets/lance-preencoded-smoke \
+LANCE_MAX_SAMPLES_PER_TASK=16 \
+LANCE_EXPECTED_TOKENS=1 \
+LANCE_MAX_TOKENS=40000 \
+NPROC_PER_NODE=8 bash scripts/prepare_lance_native_pt.sh encode
+
+LANCE_PREPARED_SAMPLES=datasets/lance-prepared-smoke \
+LANCE_PREENCODED_DATA=datasets/lance-preencoded-smoke \
+LANCE_EXPECTED_TOKENS=1 \
+LANCE_MAX_TOKENS=40000 \
+bash scripts/prepare_lance_native_pt.sh pack
+```
+
+其中 `expected=1` 让每个合格样本单独成 batch，便于确保 8 个 DP rank 都有输入；它不是完整训练
+packing 参数。完整准备应换回新的目录并使用默认 44K/50K。
+
+封装脚本默认使用本地 `train_local/unified.yaml` 的六组等权配比
+`t2i:t2v:i2i:v2v:i2t:v2t=1:1:1:1:1:1`。packer 会确定性过采样较小组，使后续 uniform
+stateful sampler 真正得到目标分布，而不只是改变一次文件排列。如需按论文四大类配比，可直接调用
+packer 并指定权重，例如：
+
+```bash
+python scripts/pack_lance_native_data.py \
+  --input datasets/lance-prepared-samples \
+  --output datasets/lance-preencoded-paper-mix \
+  --llm-config /mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct/config.json \
+  --task-weights t2v=64,v2t=16,t2i=16,i2t=4
+```
+
+### 3. 真实前向/反向与断点连续性
+
+先在真实 packed 数据上跑 1 step，保留完整 350K scheduler horizon：
+
+```bash
+LANCE_PREENCODED_DATA=datasets/lance-preencoded-smoke \
+LANCE_OUTPUT_DIR=outputs/lance-native-real-1step \
+LANCE_TRAIN_ITERS=350000 LANCE_STOP_AFTER_ITERS=1 LANCE_SAVE_INTERVAL=1 \
+NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+```
+
+原生 packed batch 最多包含 50K multimodal tokens，并带有较大的 ViT/VAE tensor。启动脚本因此
+默认 `LANCE_NUM_WORKERS=0`，在各 rank 主进程内读取，避免 8 卡 worker prefetch 再次耗尽容器
+`/dev/shm`。完成 1-step 正确性验证后，如果容器通过 `--shm-size` 或 `--ipc=host` 提供了足够
+共享内存，可分别测试 `LANCE_NUM_WORKERS=1` 和 `2`；保留吞吐更高且没有 bus error 的设置，
+不建议直接恢复为每 rank 4 个 worker。worker 模式会使用 pinned memory 和 non-blocking H2D。
+
+完成真实 20-step 后，再做连续与恢复等价测试。以下所有 output/trace 路径在执行前必须不存在或
+为空；第二段恢复是唯一会继续写同一个 split 输出目录的命令：
+
+```bash
+# 连续 20 step
+LANCE_OUTPUT_DIR=outputs/lance-native-continuous-20 \
+LANCE_TRAIN_ITERS=20 LANCE_STOP_AFTER_ITERS=20 LANCE_SAVE_INTERVAL=10 \
+LANCE_TRACE_FILE=outputs/lance-native-continuous-20/trace.jsonl \
+NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+
+# 先跑到 step 10，scheduler 的总 horizon 仍是 20
+LANCE_OUTPUT_DIR=outputs/lance-native-resume-20 \
+LANCE_TRAIN_ITERS=20 LANCE_STOP_AFTER_ITERS=10 LANCE_SAVE_INTERVAL=10 \
+LANCE_TRACE_FILE=outputs/lance-native-resume-20/trace.jsonl \
+NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+
+# 从同一 DCP 恢复到 step 20
+LANCE_LOAD_DCP=outputs/lance-native-resume-20 \
+LANCE_OUTPUT_DIR=outputs/lance-native-resume-20 \
+LANCE_TRAIN_ITERS=20 LANCE_STOP_AFTER_ITERS=20 LANCE_SAVE_INTERVAL=10 \
+LANCE_TRACE_FILE=outputs/lance-native-resume-20/trace.jsonl \
+NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+
+python scripts/compare_lance_native_traces.py \
+  --continuous outputs/lance-native-continuous-20/trace.jsonl \
+  --resumed outputs/lance-native-resume-20/trace.jsonl
+```
+
+比较器逐 rank 检查 iteration、实际 batch path、loss、CE/MSE、token 数、grad norm 和 LR。
+默认完整训练不设置 `LANCE_TRACE_FILE`，不会承担逐 step 文件写入。
+
+### 4. 启动完整 PT
+
+```bash
+NPROC_PER_NODE=8 bash scripts/pretrain_lance_native.sh
+```
+
+默认配置固定 350K steps、2500 warmup、LR `1e-4` constant、CE:MSE=`0.25:1`、AdamW
+`beta=(0.9,0.95)`/`eps=1e-15`、clip `1.0`、EMA `0.9999`。输出为可严格恢复 optimizer、
+scheduler、dataloader cursor、EMA 的 MindSpeed-MM DCP。
+
+训练入口启动前会检查 DCP tracker/release、初始化配置、tokenizer 有效词表、packed manifest、
+模型 variant 和 batch 数；任何不一致都会在创建 8 个训练进程前失败。当前原生 PT 配置固定
+TP=CP=1、FSDP2=8，I2V/subject/interleaved 以及 CP/70K 属于后续 CT/SFT 扩展，不应混入这次
+350K example PT 的验收结论。
+
+当前开发机没有 torch/torch-npu，因此这里完成的是静态编译和契约测试；上述三条 NPU 命令仍需
+在已配置的容器内执行后，才能把原生路径标记为实机验收通过。
+
+## 历史第一阶段：官方推理与评测基线
 
 本目录提供 Lance 官方 checkpoint 的零转换推理桥接和论文评测协议。第一阶段保留官方
 Lance 的模型、tokenizer、VAE 和数据处理语义，只在独立进程内将 CUDA/NCCL/FlashAttention
 映射到 NPU/HCCL/`torch_npu.npu_fusion_attention`，用于先做数值对齐。完成对齐后再将共享
 模型并入 MindSpeed-MM 的原生训练构建器。
+
+这一节只用于保留已经完成的论文推理基线，不被上述原生预训练入口调用。
 
 ## 前置条件
 
