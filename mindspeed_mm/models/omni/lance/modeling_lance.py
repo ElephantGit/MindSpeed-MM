@@ -1159,6 +1159,7 @@ class LanceNativeModel(nn.Module):
         vision_attention_backend: VisionAttentionBackend = reference_vision_sdpa,
         device=None,
         dtype=None,
+        include_vit_model: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1184,7 +1185,7 @@ class LanceNativeModel(nn.Module):
             dtype=dtype,
         )
         self.time_embedder = LanceTimestepEmbedder(config.hidden_size, device=device, dtype=dtype)
-        if config.has_vit:
+        if config.has_vit and include_vit_model:
             self.vit_model = LanceVisionModel(
                 config,
                 attention_backend=vision_attention_backend,

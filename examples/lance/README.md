@@ -162,6 +162,57 @@ TP=CP=1、FSDP2=8，I2V/subject/interleaved 以及 CP/70K 属于后续 CT/SFT �
 当前开发机没有 torch/torch-npu，因此这里完成的是静态编译和契约测试；上述三条 NPU 命令仍需
 在已配置的容器内执行后，才能把原生路径标记为实机验收通过。
 
+## 原生 T2I/T2V 推理
+
+`inference_lance_native.py` 直接加载原生训练产生的 DCP 和 `ema_state.parameters`，不会发现、
+导入或执行 Lance 官方源码，也不需要先转换为 safetensors。当前入口面向单卡 Ascend 推理，支持
+`t2i` 和 `t2v`；默认使用 EMA，传 `--model-weights` 可改用普通模型参数。
+
+对本文 PT 配置必须保持 `latent_patch_size=1 2 2`。这要求输出高宽均为 32 的倍数；Wan2.2 的
+因果时间结构要求视频帧数为 `4k+1`。因此原生默认值是 T2I `768x768x1`，T2V
+`480x864x49`，而不是发布脚本为 `1 1 1` checkpoint 使用的 `480x848x50`。
+
+先做不分配模型/NPU 的参数和路径检查：
+
+```bash
+python inference_lance_native.py \
+  --checkpoint /mnt/qs/mod/MindSpeed-MM/outputs/lance-native-pt/iter_0001500 \
+  --qwen-path /mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct \
+  --vae-path /mnt/qs/models/bytedance-research/Lance/Wan2.2_VAE.pth \
+  --task t2i \
+  --prompt "A red panda wearing sunglasses, cinematic lighting." \
+  --output-dir outputs/lance-native-t2i-1500 \
+  --dry-run
+```
+
+去掉 `--dry-run` 即可执行。T2V 示例：
+
+```bash
+python inference_lance_native.py \
+  --checkpoint /mnt/qs/mod/MindSpeed-MM/outputs/lance-native-pt/iter_0001500 \
+  --qwen-path /mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct \
+  --vae-path /mnt/qs/models/bytedance-research/Lance/Wan2.2_VAE.pth \
+  --task t2v \
+  --prompt "A red panda surfing a bright seaside wave, tracking shot." \
+  --height 480 --width 864 --num-frames 49 --fps 12 \
+  --output-dir outputs/lance-native-t2v-1500
+```
+
+也可使用封装脚本；`LANCE_CHECKPOINT` 既可指向具体 iteration，也可指向带 tracker 的 checkpoint
+根目录：
+
+```bash
+LANCE_CHECKPOINT=/mnt/qs/mod/MindSpeed-MM/outputs/lance-native-pt/iter_0001500 \
+LANCE_TASK=t2i \
+LANCE_PROMPT="A red panda wearing sunglasses, cinematic lighting." \
+LANCE_OUTPUT_DIR=outputs/lance-native-t2i-1500 \
+bash scripts/inference_lance_native.sh
+```
+
+输出目录包含 `000000.png` 或 `000000.mp4`，以及记录 checkpoint、模型/EMA选择、geometry、采样参数、
+prompt 和 seed 的 `lance_native_inference.json`。当前为了保持 prompt builder 的严格注意力语义，使用
+完整序列 sampler；KV-cache 需在目标 VAE token 调整为连续 sequence suffix 后再启用。
+
 ## 历史第一阶段：官方推理与评测基线
 
 本目录提供 Lance 官方 checkpoint 的零转换推理桥接和论文评测协议。第一阶段保留官方

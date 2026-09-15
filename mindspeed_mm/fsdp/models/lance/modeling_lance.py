@@ -100,13 +100,10 @@ class LanceFSDPModel(LanceNativeModel, BaseModel, WeightInitMixin):
             native_config,
             attention_backend=attention_backend,
             vision_attention_backend=vision_attention_backend,
+            include_vit_model=include_vit_model,
             device=device,
             dtype=dtype,
         )
-        if not include_vit_model and hasattr(self, "vit_model"):
-            # Pre-encoded PT consumes frozen ViT outputs.  Keeping the 32-layer
-            # encoder resident would waste memory and FSDP/checkpoint traffic.
-            del self.vit_model
         self.loss_weights = LanceLossWeights(float(ce_weight), float(mse_weight))
         self.timestep_shift = float(timestep_shift)
         self.validate_batches = bool(validate_batches)
