@@ -219,7 +219,7 @@ LANCE_CONFIG_PATH=/mnt/qs/mod/Lance/config/examples/x2t_image_example.json \
 VIT_PATH=/mnt/qs/models/bytedance-research/Lance/Qwen2.5-VL-ViT \
 QWEN_PATH=/mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct \
 LANCE_OUTPUT_DIR=outputs/lance-native-i2t-1500 \
-bash scripts/lance-native-inference.sh
+bash scripts/inference_lance_native.sh
 ```
 
 I2T 复用官方 `x2t_image_example.json` 的 `interleave_array`、`element_dtype_array` 和
