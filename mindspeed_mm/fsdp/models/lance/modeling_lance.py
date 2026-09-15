@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch.distributed.fsdp import fully_shard as torch_fully_shard
 
 from mindspeed_mm.fsdp.models.base_model import BaseModel, WeightInitMixin
@@ -22,6 +21,7 @@ from mindspeed_mm.models.omni.lance.initialization import load_native_lance_chec
 from mindspeed_mm.models.omni.lance.initialization import initialize_random
 from mindspeed_mm.models.omni.lance.modeling_lance import (
     LanceNativeModel,
+    LanceVisionConnector,
     reference_sdpa,
     reference_vision_sdpa,
 )
@@ -46,24 +46,6 @@ class LanceModelOutput:
     mse_loss: Optional[torch.Tensor]
     ce_tokens: int
     mse_tokens: int
-
-
-class LanceVisionConnector(torch.nn.Module):
-    """Trainable Qwen-ViT-to-Lance adapter used by the PT recipe.
-
-    Released inference checkpoints do not need this module because their
-    understanding path is already aligned.  Pretraining enables it explicitly
-    while keeping the expensive ViT backbone frozen.
-    """
-
-    def __init__(self, hidden_size: int, *, device=None, dtype=None) -> None:
-        super().__init__()
-        factory_kwargs = {"device": device, "dtype": dtype}
-        self.fc1 = torch.nn.Linear(hidden_size, hidden_size, **factory_kwargs)
-        self.fc2 = torch.nn.Linear(hidden_size, hidden_size, **factory_kwargs)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(hidden_states), approximate="tanh"))
 
 
 def _getattr(config, name, default=None):
@@ -101,6 +83,7 @@ class LanceFSDPModel(LanceNativeModel, BaseModel, WeightInitMixin):
             attention_backend=attention_backend,
             vision_attention_backend=vision_attention_backend,
             include_vit_model=include_vit_model,
+            use_vit_connector=use_vit_connector,
             device=device,
             dtype=dtype,
         )
@@ -113,14 +96,6 @@ class LanceFSDPModel(LanceNativeModel, BaseModel, WeightInitMixin):
         )
         if not 0 < self.effective_vocab_size <= native_config.vocab_size:
             raise ValueError("effective_vocab_size must be in (0, vocab_size]")
-        self.connector = (
-            LanceVisionConnector(
-                native_config.hidden_size,
-                device=device,
-                dtype=dtype,
-            )
-            if use_vit_connector else None
-        )
 
     @staticmethod
     def _native_config(model_args) -> LanceNativeConfig:

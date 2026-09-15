@@ -90,14 +90,21 @@ def lance_system_prompt(prompt_type: str, vision_type: str, choice: int = 0) -> 
     return candidates[int(choice) % len(candidates)].format(vision=vision_type)
 
 
-def _render_chat(system_prompt: str, user_content: str, assistant_content: str) -> str:
+def _render_chat(
+    system_prompt: str,
+    user_content: str,
+    assistant_content: str,
+    *,
+    close_assistant: bool = True,
+) -> str:
     """Render the exact two-turn Qwen template used by Lance PT."""
 
+    assistant_end = "<|im_end|>" if close_assistant else ""
     return (
         "<|im_start|>system\n{}<|im_end|>\n"
         "<|im_start|>user\n{}<|im_end|>\n"
-        "<|im_start|>assistant\n{}<|im_end|>"
-    ).format(system_prompt, user_content, assistant_content)
+        "<|im_start|>assistant\n{}{}"
+    ).format(system_prompt, user_content, assistant_content, assistant_end)
 
 
 def _visual_placeholder(modality: str) -> str:
@@ -372,6 +379,7 @@ class _SampleAssembler:
         visuals,
         *,
         assistant_ce: bool,
+        close_assistant: bool = True,
     ) -> None:
         """Tokenize one official Lance chat template and install media spans.
 
@@ -383,7 +391,12 @@ class _SampleAssembler:
         if self.token_ids:
             raise ValueError("one Lance prepared sample must contain exactly one rendered chat")
         placeholder = _visual_placeholder("video")
-        rendered = _render_chat(system_prompt, user_content, assistant_content)
+        rendered = _render_chat(
+            system_prompt,
+            user_content,
+            assistant_content,
+            close_assistant=close_assistant,
+        )
         if rendered.count(placeholder) != len(visuals):
             raise ValueError("rendered visual placeholders do not match encoded visual inputs")
         normalized_visuals = []
@@ -549,6 +562,28 @@ def build_understanding_sample(
         str(answer),
         ((condition, "vit", False),),
         assistant_ce=True,
+    )
+    return assembler.build()
+
+
+def build_understanding_prompt_sample(
+    sample_id, prompt, condition, tokenizer, config, *, system_prompt=None
+):
+    """Build an I2T/V2T inference prefix ending at ``assistant\n``."""
+
+    assembler = _SampleAssembler(
+        sample_id,
+        tokenizer,
+        config,
+        LanceSpecialTokens.from_tokenizer(tokenizer),
+    )
+    assembler.add_chat(
+        system_prompt or lance_system_prompt("caption", condition.modality),
+        _visual_placeholder(condition.modality) + ("" if not prompt else str(prompt)),
+        "",
+        ((condition, "vit", False),),
+        assistant_ce=False,
+        close_assistant=False,
     )
     return assembler.build()
 

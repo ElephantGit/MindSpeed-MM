@@ -162,11 +162,11 @@ TP=CP=1、FSDP2=8，I2V/subject/interleaved 以及 CP/70K 属于后续 CT/SFT �
 当前开发机没有 torch/torch-npu，因此这里完成的是静态编译和契约测试；上述三条 NPU 命令仍需
 在已配置的容器内执行后，才能把原生路径标记为实机验收通过。
 
-## 原生 T2I/T2V 推理
+## 原生 T2I/T2V/I2T 推理
 
 `inference_lance_native.py` 直接加载原生训练产生的 DCP 和 `ema_state.parameters`，不会发现、
 导入或执行 Lance 官方源码，也不需要先转换为 safetensors。当前入口面向单卡 Ascend 推理，支持
-`t2i` 和 `t2v`；默认使用 EMA，传 `--model-weights` 可改用普通模型参数。
+`t2i`、`t2v` 和 `i2t`；默认使用 EMA，传 `--model-weights` 可改用普通模型参数。
 
 对本文 PT 配置必须保持 `latent_patch_size=1 2 2`。这要求输出高宽均为 32 的倍数；Wan2.2 的
 因果时间结构要求视频帧数为 `4k+1`。因此原生默认值是 T2I `768x768x1`，T2V
@@ -209,9 +209,28 @@ LANCE_OUTPUT_DIR=outputs/lance-native-t2i-1500 \
 bash scripts/inference_lance_native.sh
 ```
 
-输出目录包含 `000000.png` 或 `000000.mp4`，以及记录 checkpoint、模型/EMA选择、geometry、采样参数、
-prompt 和 seed 的 `lance_native_inference.json`。当前为了保持 prompt builder 的严格注意力语义，使用
-完整序列 sampler；KV-cache 需在目标 VAE token 调整为连续 sequence suffix 后再启用。
+使用 Lance 官方 image-understanding 示例运行 I2T：
+
+```bash
+LANCE_CHECKPOINT=/mnt/qs/mod/MindSpeed-MM/outputs/lance-native-pt/iter_0001500 \
+LANCE_TASK=i2t \
+LANCE_OFFICIAL_ROOT=/mnt/qs/mod/Lance \
+LANCE_CONFIG_PATH=/mnt/qs/mod/Lance/config/examples/x2t_image_example.json \
+VIT_PATH=/mnt/qs/models/bytedance-research/Lance/Qwen2.5-VL-ViT \
+QWEN_PATH=/mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct \
+LANCE_OUTPUT_DIR=outputs/lance-native-i2t-1500 \
+bash scripts/lance-native-inference.sh
+```
+
+I2T 复用官方 `x2t_image_example.json` 的 `interleave_array`、`element_dtype_array` 和
+`istarget_in_interleave` 结构。相对图片路径会从当前目录和 JSON 的各级父目录解析，因此官方
+`assets/image-understanding/...` 路径无需改写。理解模型和 PT connector 从 DCP/EMA 加载；训练时
+冻结且未写入 DCP 的 Qwen2.5-VL ViT 从 `VIT_PATH` 单独加载。I2T 不加载 Wan VAE，使用 KV-cache
+进行最多 256 token 的 greedy decoding。
+
+T2I/T2V 输出目录包含 `000000.png` 或 `000000.mp4`；I2T 输出 `result.json` 和 `prompt.json`。
+三者都会写入记录 checkpoint、模型/EMA 选择和推理参数的 `lance_native_inference.json`。生成任务
+当前为了保持 prompt builder 的严格注意力语义使用完整序列 sampler；理解任务使用增量 KV-cache。
 
 ## 历史第一阶段：官方推理与评测基线
 

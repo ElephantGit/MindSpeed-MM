@@ -1,13 +1,14 @@
-"""End-to-end helpers for native Lance text-to-image/video inference.
+"""End-to-end helpers for native Lance generation and understanding inference.
 
 This module deliberately uses only MindSpeed-MM's native Lance model, prompt
 builder, sampler, and Wan2.2 VAE.  It does not import or execute the standalone
 Lance checkout.
 """
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Mapping, Tuple, Union
+from typing import Dict, List, Mapping, Tuple, Union
 
 import torch
 
@@ -37,6 +38,151 @@ class LanceGenerationGeometry:
     @property
     def latent_shape(self) -> Tuple[int, int, int]:
         return self.latent_frames, self.latent_height, self.latent_width
+
+
+@dataclass(frozen=True)
+class LanceI2TRequest:
+    """One image-understanding request in Lance's official example format."""
+
+    sample_id: str
+    image: Path
+    system_prompt: str
+    question: str
+
+
+def _resolve_i2t_image(value: str, config_path: Path) -> Path:
+    image = Path(value).expanduser()
+    if image.is_absolute():
+        candidates = (image,)
+    else:
+        candidates = (
+            Path.cwd() / image,
+            *(parent / image for parent in config_path.parents),
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise LanceNativeInferenceError(
+        "I2T image does not exist (paths are resolved from cwd and config ancestors): {}".format(
+            value
+        )
+    )
+
+
+def read_official_i2t_requests(path: Union[str, Path]) -> List[LanceI2TRequest]:
+    """Read Lance's official ``x2t_image_example.json`` schema."""
+
+    source = Path(path).expanduser().resolve()
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LanceNativeInferenceError(
+            "cannot read Lance I2T config {}: {}".format(source, exc)
+        ) from exc
+    if not isinstance(payload, dict) or not payload:
+        raise LanceNativeInferenceError("Lance I2T config must be a non-empty JSON object")
+
+    requests = []
+    for sample_id, sample in payload.items():
+        if not isinstance(sample, dict):
+            raise LanceNativeInferenceError(
+                "I2T sample {} must be a JSON object".format(sample_id)
+            )
+        interleave = sample.get("interleave_array")
+        dtypes = sample.get("element_dtype_array")
+        targets = sample.get("istarget_in_interleave")
+        if (
+            not isinstance(interleave, list)
+            or len(interleave) != 2
+            or dtypes != ["image", "text"]
+            or targets != [0, 1]
+        ):
+            raise LanceNativeInferenceError(
+                "I2T sample {} does not match the official image/text interleave schema".format(
+                    sample_id
+                )
+            )
+        text = interleave[1]
+        if not isinstance(interleave[0], str) or not isinstance(text, list) or len(text) < 2:
+            raise LanceNativeInferenceError(
+                "I2T sample {} requires an image path and [system, question, answer] text".format(
+                    sample_id
+                )
+            )
+        requests.append(
+            LanceI2TRequest(
+                sample_id=str(sample_id),
+                image=_resolve_i2t_image(interleave[0], source),
+                system_prompt=str(text[0]),
+                question=str(text[1]),
+            )
+        )
+    return requests
+
+
+@torch.no_grad()
+def generate_native_understanding(
+    model: LanceNativeModel,
+    sample: LancePreparedSample,
+    *,
+    eos_token_id: int,
+    effective_vocab_size: int,
+    max_new_tokens: int,
+    attention_backend,
+) -> torch.Tensor:
+    """Greedy autoregressive decoding with an incrementally updated KV cache."""
+
+    if max_new_tokens <= 0:
+        raise LanceNativeInferenceError("max_new_tokens must be positive")
+    if not 0 < effective_vocab_size <= model.config.vocab_size:
+        raise LanceNativeInferenceError("effective vocabulary is incompatible with the model")
+    sample.validate(model.config)
+    if sample.vit_indexes is None or sample.vit_embeddings is None:
+        raise LanceNativeInferenceError("I2T inference requires encoded ViT tokens")
+    if sample.vae_indexes is not None:
+        raise LanceNativeInferenceError("I2T inference must not contain VAE tokens")
+
+    device = next(model.parameters()).device
+    token_ids = sample.token_ids.to(device)
+    vit_indexes = sample.vit_indexes.to(device)
+    sequence = model.language_model.model.embed_tokens(token_ids)
+    sequence[vit_indexes] = sample.vit_embeddings.to(
+        device=device, dtype=sequence.dtype
+    )
+    understanding = sample.understanding_indexes.to(device)
+    generation = sample.generation_indexes.to(device)
+    hidden, cache = model.build_language_kv_cache(
+        sequence,
+        sample.position_ids.to(device),
+        LancePackedSequence((sample.document,)),
+        understanding,
+        generation,
+    )
+
+    generated = []
+    logits = model.language_model.lm_head(hidden[-1])[:effective_vocab_size]
+    empty_generation = torch.empty(0, dtype=torch.long, device=device)
+    one_understanding = torch.zeros(1, dtype=torch.long, device=device)
+    last_position = sample.position_ids[:, -1:].to(device)
+    for step in range(max_new_tokens):
+        token = torch.argmax(logits, dim=-1).reshape(1)
+        token_id = int(token.item())
+        generated.append(token_id)
+        if token_id == int(eos_token_id):
+            break
+        query = model.language_model.model.embed_tokens(token)
+        query_position = last_position + step + 1
+        hidden, cache = model.append_language_kv_cache(
+            query,
+            query_position,
+            one_understanding,
+            empty_generation,
+            cache,
+            attention_backend=attention_backend,
+            is_causal=True,
+        )
+        logits = model.language_model.lm_head(hidden[-1])[:effective_vocab_size]
+    return torch.tensor(generated, dtype=torch.long)
 
 
 def resolve_native_dcp(path: Union[str, Path]) -> Path:
@@ -276,10 +422,10 @@ def load_native_generation_dcp(
 ) -> Dict[str, object]:
     """Load native training DCP weights directly into an allocated model.
 
-    Generation does not need the frozen ViT or the PT-only connector.  The
-    loader therefore requests the native MoT/bridge/head subset and safely
-    ignores those extra DCP entries.  EMA parameters overwrite their matching
-    model tensors without allocating a second model tree.
+    The allocated model selects the needed DCP subset. Generation omits the
+    PT-only connector, while I2T includes it but still omits the frozen ViT,
+    which is restored separately from its source artifact. EMA parameters
+    overwrite matching model tensors without allocating a second model tree.
     """
 
     try:

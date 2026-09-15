@@ -165,3 +165,48 @@ def test_invalid_cache_shape_is_rejected():
             torch.tensor([0]),
             cache,
         )
+
+
+def test_incremental_cache_append_matches_full_causal_decode():
+    torch.manual_seed(47)
+    model = LanceNativeModel(_tiny_config()).eval()
+    hidden = torch.randn(6, model.config.hidden_size)
+    positions = torch.arange(6).repeat(3, 1)
+    understanding = torch.arange(6)
+    no_generation = torch.empty(0, dtype=torch.long)
+    full_mask = torch.ones(6, 6, dtype=torch.bool).tril()
+    expected = model.forward_language(
+        hidden,
+        positions,
+        full_mask,
+        understanding,
+        no_generation,
+    )
+
+    prefix_length = 3
+    prefix_output, cache = model.build_language_kv_cache(
+        hidden[:prefix_length],
+        positions[:, :prefix_length],
+        full_mask[:prefix_length, :prefix_length],
+        torch.arange(prefix_length),
+        no_generation,
+    )
+    outputs = [prefix_output]
+    for index in range(prefix_length, hidden.shape[0]):
+        output, cache = model.append_language_kv_cache(
+            hidden[index:index + 1],
+            positions[:, index:index + 1],
+            torch.tensor([0]),
+            no_generation,
+            cache,
+            is_causal=True,
+        )
+        outputs.append(output)
+
+    torch.testing.assert_close(
+        torch.cat(outputs),
+        expected,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert cache.condition_length == hidden.shape[0]

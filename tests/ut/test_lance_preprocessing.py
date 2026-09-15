@@ -12,6 +12,7 @@ from mindspeed_mm.models.omni.lance.preprocessing import (
     build_edit_sample,
     build_generation_sample,
     build_understanding_sample,
+    build_understanding_prompt_sample,
     patchify_qwen_video,
 )
 from scripts.prepare_lance_native_data import _bucket_size, _sample_video_indices
@@ -97,6 +98,24 @@ def test_native_generation_and_understanding_samples_validate():
     # Lance shifts semantic ViT conditions into temporal MaPE band 1000.
     assert understanding.position_ids[0, understanding.vit_indexes[0]].item() >= 1000
     assert torch.unique(generation.position_ids[:, generation.vae_indexes], dim=1).shape[1] > 1
+
+
+def test_understanding_inference_prefix_leaves_assistant_turn_open():
+    config = _config()
+    tokenizer = _Tokenizer()
+    sample = build_understanding_prompt_sample(
+        "i2t-inference",
+        "What is shown?",
+        _visual(vae=False),
+        tokenizer,
+        config,
+        system_prompt="Answer the question.",
+    )
+    sample.validate(config)
+    assert sample.ce_indexes is None
+    assert sample.mse_indexes is None
+    assert sample.token_ids[-1].item() != tokenizer.mapping["<|im_end|>"]
+    assert sample.vit_indexes.numel() == 3
 
 
 def test_native_edit_routes_all_vae_tokens_to_generation_expert():

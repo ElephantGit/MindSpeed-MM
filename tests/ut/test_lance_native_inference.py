@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -7,18 +8,24 @@ os.environ.setdefault("NON_MEGATRON", "true")
 torch = pytest.importorskip("torch")
 
 from mindspeed_mm.models.omni.lance.native_config import LanceNativeConfig
-from mindspeed_mm.models.omni.lance.modeling_lance import LanceNativeModel
+from mindspeed_mm.models.omni.lance.modeling_lance import (
+    LanceNativeModel,
+    reference_kv_sdpa,
+)
 from mindspeed_mm.models.omni.lance.native_inference import (
     LanceNativeInferenceError,
+    generate_native_understanding,
     generation_geometry,
     load_native_generation_dcp,
     prepared_sample_to_denoise_context,
+    read_official_i2t_requests,
     resolve_native_dcp,
     unpatchify_lance_latents,
 )
 from mindspeed_mm.models.omni.lance.preprocessing import (
     LanceEncodedVisual,
     build_generation_sample,
+    build_understanding_prompt_sample,
 )
 from mindspeed_mm.models.omni.lance.sequence import LancePackedSequence
 
@@ -94,6 +101,65 @@ def test_generation_model_can_skip_video_vit_allocation():
     model = LanceNativeModel(_config(), include_vit_model=False)
     assert not hasattr(model, "vit_model")
     assert model.language_model.model.rotary_emb.inv_freq.device.type == "cpu"
+
+
+def test_i2t_model_allocates_connector_without_frozen_vit():
+    model = LanceNativeModel(
+        _config(), include_vit_model=False, use_vit_connector=True
+    )
+    assert not hasattr(model, "vit_model")
+    assert model.connector is not None
+    assert "connector.fc1.weight" in model.state_dict()
+
+
+def test_read_official_i2t_example_resolves_repo_relative_image(tmp_path):
+    image = tmp_path / "assets" / "case.png"
+    image.parent.mkdir()
+    image.write_bytes(b"not-decoded-in-this-test")
+    config_dir = tmp_path / "config" / "examples"
+    config_dir.mkdir(parents=True)
+    config = config_dir / "x2t_image_example.json"
+    config.write_text(json.dumps({
+        "0001": {
+            "interleave_array": [
+                "assets/case.png",
+                ["Look carefully.", "What is shown?", "reference answer"],
+            ],
+            "element_dtype_array": ["image", "text"],
+            "istarget_in_interleave": [0, 1],
+        }
+    }))
+    requests = read_official_i2t_requests(config)
+    assert len(requests) == 1
+    assert requests[0].sample_id == "0001"
+    assert requests[0].image == image.resolve()
+    assert requests[0].question == "What is shown?"
+
+
+def test_native_understanding_greedy_decode_stops_at_im_end():
+    config = _config()
+    model = LanceNativeModel(config, include_vit_model=False).eval()
+    model.language_model.lm_head.weight.data.zero_()
+    sample = build_understanding_prompt_sample(
+        "i2t",
+        "What is shown?",
+        LanceEncodedVisual(
+            "image",
+            vit_embedding=torch.randn(4, config.hidden_size),
+            vit_grid_thw=(1, 4, 4),
+        ),
+        _Tokenizer(),
+        config,
+    )
+    generated = generate_native_understanding(
+        model,
+        sample,
+        eos_token_id=0,
+        effective_vocab_size=config.vocab_size,
+        max_new_tokens=8,
+        attention_backend=reference_kv_sdpa,
+    )
+    assert generated.tolist() == [0]
 
 
 def test_native_generation_loader_restores_model_and_overlays_ema(tmp_path):
