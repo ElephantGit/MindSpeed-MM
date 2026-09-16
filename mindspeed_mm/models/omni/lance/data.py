@@ -55,6 +55,7 @@ class LancePreparedSample:
 
     vae_indexes: Optional[torch.Tensor] = None
     clean_latents: Optional[torch.Tensor] = None
+    latent_log_variance: Optional[torch.Tensor] = None
     latent_position_ids: Optional[torch.Tensor] = None
     timesteps: Optional[torch.Tensor] = None
     noise: Optional[torch.Tensor] = None
@@ -107,11 +108,18 @@ class LancePreparedSample:
 
         vae_fields = (self.clean_latents, self.latent_position_ids, self.timesteps)
         if self.vae_indexes is None:
-            if any(field is not None for field in vae_fields + (self.noise,)):
+            if any(
+                field is not None
+                for field in vae_fields + (self.noise, self.latent_log_variance)
+            ):
                 raise LanceDataError("VAE tensors require vae_indexes")
         elif not all(field is not None for field in vae_fields):
             raise LanceDataError("VAE indexes, latents, positions, and timesteps are required together")
         else:
+            if vae.numel() > 1 and torch.any(vae[1:] <= vae[:-1]):
+                raise LanceDataError(
+                    "VAE indexes must be strictly increasing for compact latent lookup"
+                )
             count = vae.numel()
             expected_latent_shape = (count, config.patch_latent_dim)
             if self.clean_latents.shape != expected_latent_shape:
@@ -128,6 +136,11 @@ class LancePreparedSample:
                 raise LanceDataError("latent_position_ids exceed the configured position table")
             if self.noise is not None and self.noise.shape != expected_latent_shape:
                 raise LanceDataError("noise shape does not match clean_latents")
+            if (
+                self.latent_log_variance is not None
+                and self.latent_log_variance.shape != expected_latent_shape
+            ):
+                raise LanceDataError("latent_log_variance shape does not match clean_latents")
 
         if (self.vit_indexes is None) != (self.vit_embeddings is None):
             raise LanceDataError("ViT indexes and embeddings must be provided together")
@@ -241,6 +254,15 @@ def pack_preencoded_samples(
     vae_samples = [sample for sample in samples if sample.vae_indexes is not None]
     vae_indexes = _pack_indexes(samples, offsets, "vae_indexes") if vae_samples else None
     clean_latents = torch.cat([sample.clean_latents for sample in vae_samples]) if vae_samples else None
+    posterior = [sample.latent_log_variance is not None for sample in vae_samples]
+    if posterior and any(posterior) and not all(posterior):
+        raise LanceDataError(
+            "posterior log variance must be provided for every packed VAE sample or none"
+        )
+    latent_log_variance = (
+        torch.cat([sample.latent_log_variance for sample in vae_samples])
+        if posterior and all(posterior) else None
+    )
     latent_position_ids = (
         torch.cat([sample.latent_position_ids for sample in vae_samples]) if vae_samples else None
     )
@@ -274,6 +296,7 @@ def pack_preencoded_samples(
         generation_indexes=generation_indexes,
         vae_indexes=vae_indexes,
         clean_latents=clean_latents,
+        latent_log_variance=latent_log_variance,
         latent_position_ids=latent_position_ids,
         timesteps=timesteps,
         noise=noise,

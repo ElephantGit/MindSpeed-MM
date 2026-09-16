@@ -80,6 +80,19 @@ class LanceMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
+class LanceVisionConnector(nn.Module):
+    """Trainable Qwen-ViT-to-Lance adapter used by native PT and inference."""
+
+    def __init__(self, hidden_size: int, *, device=None, dtype=None) -> None:
+        super().__init__()
+        factory = {"device": device, "dtype": dtype}
+        self.fc1 = nn.Linear(hidden_size, hidden_size, **factory)
+        self.fc2 = nn.Linear(hidden_size, hidden_size, **factory)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(hidden_states), approximate="tanh"))
+
+
 def rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
     first, second = hidden_states.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
@@ -195,12 +208,6 @@ def _validate_routes(length: int, understanding: torch.Tensor, generation: torch
     combined = torch.cat((understanding, generation))
     if combined.numel() != length:
         raise ValueError("expert routes must cover every token exactly once")
-    if combined.numel() and (
-        int(combined.min().item()) < 0
-        or int(combined.max().item()) >= length
-        or int(torch.unique(combined).numel()) != length
-    ):
-        raise ValueError("expert routes contain duplicates or out-of-range indexes")
 
 
 class LanceMoTAttention(nn.Module):
@@ -244,12 +251,15 @@ class LanceMoTAttention(nn.Module):
         generation_projection: nn.Module,
         output_size: int,
     ) -> torch.Tensor:
+        understanding = understanding_projection(hidden_states[understanding_indexes])
+        generation = generation_projection(hidden_states[generation_indexes])
         output = hidden_states.new_empty((hidden_states.shape[0], output_size))
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_projection(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_projection(hidden_states[generation_indexes])
-        return output
+        # Execute both experts even for a zero-length local route.  This keeps
+        # their autograd participation symmetric when DP ranks carry different
+        # modalities and avoids conditional-expert FSDP reductions.
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     @staticmethod
     def _route_norm(
@@ -259,12 +269,12 @@ class LanceMoTAttention(nn.Module):
         understanding_norm: nn.Module,
         generation_norm: nn.Module,
     ) -> torch.Tensor:
+        understanding = understanding_norm(hidden_states[understanding_indexes])
+        generation = generation_norm(hidden_states[generation_indexes])
         output = torch.empty_like(hidden_states)
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_norm(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_norm(hidden_states[generation_indexes])
-        return output
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     def project_qkv(
         self,
@@ -376,6 +386,35 @@ class LanceMoTAttention(nn.Module):
         attended = attention_backend(query, merged_key, merged_value, is_causal)
         return self.project_output(attended, understanding_indexes, generation_indexes)
 
+    def forward_and_update_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        layer_cache: LanceLayerKVCache,
+        attention_backend: KVAttentionBackend,
+        is_causal: bool,
+    ) -> Tuple[torch.Tensor, LanceLayerKVCache]:
+        """Attend to cached tokens and append the current query K/V."""
+
+        query, key, value = self.project_qkv(
+            hidden_states,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+        )
+        merged = LanceLayerKVCache(
+            key=torch.cat((layer_cache.key, key), dim=0),
+            value=torch.cat((layer_cache.value, value), dim=0),
+        )
+        attended = attention_backend(query, merged.key, merged.value, is_causal)
+        return self.project_output(
+            attended, understanding_indexes, generation_indexes
+        ), merged
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -428,12 +467,15 @@ class LanceMoTDecoderLayer(nn.Module):
         understanding_module: nn.Module,
         generation_module: nn.Module,
     ) -> torch.Tensor:
+        understanding = understanding_module(hidden_states[understanding_indexes])
+        generation = generation_module(hidden_states[generation_indexes])
         output = torch.empty_like(hidden_states)
-        if understanding_indexes.numel():
-            output[understanding_indexes] = understanding_module(hidden_states[understanding_indexes])
-        if generation_indexes.numel():
-            output[generation_indexes] = generation_module(hidden_states[generation_indexes])
-        return output
+        output[understanding_indexes] = understanding
+        output[generation_indexes] = generation
+        # Mixed-task data parallel ranks can have an empty local route.  Keep
+        # both independently wrapped FSDP2 experts in the autograd graph so
+        # every rank executes the same reduce-scatter sequence in backward.
+        return output + (understanding.sum() + generation.sum()) * 0.0
 
     def forward(
         self,
@@ -559,6 +601,51 @@ class LanceMoTDecoderLayer(nn.Module):
             self.mlp_moe_gen,
         )
         return hidden_states + feed_forward
+
+    def forward_and_update_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        rotary_embedding: LanceMultimodalRotaryEmbedding,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        layer_cache: LanceLayerKVCache,
+        attention_backend: KVAttentionBackend,
+        is_causal: bool,
+    ) -> Tuple[torch.Tensor, LanceLayerKVCache]:
+        normalized = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.input_layernorm,
+            self.input_layernorm_moe_gen,
+        )
+        attention_output, updated_cache = self.self_attn.forward_and_update_kv_cache(
+            normalized,
+            position_embeddings,
+            rotary_embedding,
+            understanding_indexes,
+            generation_indexes,
+            layer_cache,
+            attention_backend,
+            is_causal,
+        )
+        hidden_states = hidden_states + attention_output
+        post_attention = self._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.post_attention_layernorm,
+            self.post_attention_layernorm_moe_gen,
+        )
+        feed_forward = self._route(
+            post_attention,
+            understanding_indexes,
+            generation_indexes,
+            self.mlp,
+            self.mlp_moe_gen,
+        )
+        return hidden_states + feed_forward, updated_cache
 
 
 class LanceDecoderModel(nn.Module):
@@ -703,6 +790,54 @@ class LanceDecoderModel(nn.Module):
             generation_indexes,
             self.norm,
             self.norm_moe_gen,
+        )
+
+    def append_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        kv_cache: LanceKVCache,
+        attention_backend: KVAttentionBackend = reference_kv_sdpa,
+        is_causal: bool = True,
+    ) -> Tuple[torch.Tensor, LanceKVCache]:
+        """Decode query tokens and append their per-layer K/V to the cache."""
+
+        _validate_routes(hidden_states.shape[0], understanding_indexes, generation_indexes)
+        if len(kv_cache.layers) != len(self.layers):
+            raise ValueError("KV-cache layer count does not match the decoder")
+        position_embeddings = self.rotary_emb(position_ids, hidden_states.dtype)
+        updated_layers = []
+        query_length = hidden_states.shape[0]
+        for layer, layer_cache in zip(self.layers, kv_cache.layers):
+            expected = (
+                kv_cache.condition_length,
+                layer.self_attn.num_key_value_heads,
+                layer.self_attn.head_dim,
+            )
+            if layer_cache.key.shape != expected or layer_cache.value.shape != expected:
+                raise ValueError("KV-cache tensor shape does not match the decoder")
+            hidden_states, updated = layer.forward_and_update_kv_cache(
+                hidden_states,
+                position_embeddings,
+                self.rotary_emb,
+                understanding_indexes,
+                generation_indexes,
+                layer_cache,
+                attention_backend,
+                is_causal,
+            )
+            updated_layers.append(updated)
+        normalized = LanceMoTDecoderLayer._route(
+            hidden_states,
+            understanding_indexes,
+            generation_indexes,
+            self.norm,
+            self.norm_moe_gen,
+        )
+        return normalized, LanceKVCache(
+            tuple(updated_layers), kv_cache.condition_length + query_length
         )
 
 
@@ -1159,6 +1294,8 @@ class LanceNativeModel(nn.Module):
         vision_attention_backend: VisionAttentionBackend = reference_vision_sdpa,
         device=None,
         dtype=None,
+        include_vit_model: bool = True,
+        use_vit_connector: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1184,13 +1321,21 @@ class LanceNativeModel(nn.Module):
             dtype=dtype,
         )
         self.time_embedder = LanceTimestepEmbedder(config.hidden_size, device=device, dtype=dtype)
-        if config.has_vit:
+        if config.has_vit and include_vit_model:
             self.vit_model = LanceVisionModel(
                 config,
                 attention_backend=vision_attention_backend,
                 device=device,
                 dtype=dtype,
             )
+        self.connector = (
+            LanceVisionConnector(
+                config.hidden_size,
+                device=device,
+                dtype=dtype,
+            )
+            if use_vit_connector else None
+        )
 
     def forward_language(
         self,
@@ -1238,6 +1383,26 @@ class LanceNativeModel(nn.Module):
         is_causal: bool = False,
     ) -> torch.Tensor:
         return self.language_model.model.forward_with_kv_cache(
+            hidden_states,
+            position_ids,
+            understanding_indexes,
+            generation_indexes,
+            kv_cache,
+            attention_backend,
+            is_causal,
+        )
+
+    def append_language_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        understanding_indexes: torch.Tensor,
+        generation_indexes: torch.Tensor,
+        kv_cache: LanceKVCache,
+        attention_backend: KVAttentionBackend = reference_kv_sdpa,
+        is_causal: bool = True,
+    ) -> Tuple[torch.Tensor, LanceKVCache]:
+        return self.language_model.model.append_kv_cache(
             hidden_states,
             position_ids,
             understanding_indexes,

@@ -104,9 +104,10 @@ MindSpeed DCP，`verify-dcp` 无需分配模型即可回读名称、shape 和 dt
 当前已完成语义 oracle、block compiler 与 NPU block backend：原生 `LancePackedSequence` 固定
 `causal/full/noise/full_noise/full_noise_target` 的精确关系、document 隔离和 MoT token routing；
 `noise` target 只允许自身 full attention，禁止被其他 segment 当作 KV。70K 测试只构造常数级
-block 描述，dense oracle 超过 4096 tokens 会主动报错。Ascend backend 按 query segment 拼接
-历史 clean KV 和自身 KV，使用 TND fusion attention，测试替身已与 dense oracle 数值对齐且确认
-不会传入 `[L,L]` mask。真实 NPU kernel 输出/梯度以及 CP 通信仍需在 Ascend 环境验收。
+block 描述，dense oracle 超过 4096 tokens 会主动报错。Ascend backend 按 query segment 编译
+允许的 K/V，再把相同 causal/full 类型合并为每层最多两个 TND varlen fusion-attention 调用；
+测试替身已与 dense oracle 数值对齐且确认不会传入 `[L,L]` mask。真实 NPU kernel 输出/梯度以及
+CP 通信仍需在 Ascend 环境验收。
 
 原生推理现已支持逐层 post-RoPE K/V cache。条件前缀只投影一次，每个 diffusion step 仅重算
 noisy VAE query；full/causal 两种 `q_len != kv_len` 路径均与完整序列 oracle 对齐。NPU backend
@@ -117,8 +118,8 @@ noisy VAE query；full/causal 两种 `q_len != kv_len` 路径均与完整序列 
 ### II-3 数据与损失
 
 统一样本 schema 保留 ordered segments、modality、clean/noisy/target、3D grid、loss mask 和
-sample id。实现 I2T、V2T、T2I、T2V、I2V、image/video edit、subject-driven generation、
-interleaved X2T/X2I/X2V。
+sample id。完整路线最终覆盖 I2T、V2T、T2I、T2V、I2V、image/video edit、subject-driven
+generation、interleaved X2T/X2I/X2V；本轮 PT example 数据首先闭环 I2T/V2T/T2I/T2V/I2I/V2V。
 
 - ViT/VAE 在 PT 冻结，数据侧预编码与在线编码可切换；
 - CE:MSE 权重为 PT `0.25:1`、CT `0.5:1`、SFT `0.25:1`；
@@ -131,9 +132,12 @@ interleaved X2T/X2I/X2V。
 原生 joint step 已支持预编码 ViT/VAE 输入、`(1-t)clean+t*noise`、`noise-clean` target、CE/MSE
 全局 denominator 和真实 backward。原生推理 sampler 已固定 shifted timestep、
 `x <- x - v*dt`、文本/视觉三分支 CFG、global/channel renorm、CFG interval 以及 edit 子区域更新，
-并通过 tiny 模型端到端确定性测试。官方 `PackedDataset` 后处理适配器已支持 online/offline Wan-VAE、
-原生/离线 ViT、timestep logits、1D/3D position IDs、CE/MSE 选择以及 attention segment 内逐 token
-MoT 路由。尚待在目标镜像加载生产 tokenizer/Wan-VAE 权重并跑真实 parquet 数据。
+并通过 tiny 模型端到端确定性测试。原生预处理现在直接使用 Qwen tokenizer、MindSpeed-MM 内置
+Qwen2.5-VL ViT 与 Wan2.2 VAE，按官方 chat template、visual span、assistant CE 范围和 MoT route
+产生样本；VAE posterior mean/log-variance 离线保存，latent/timestep/noise 在每次训练访问时重新采样。
+Qwen 三轴 MRoPE、ViT temporal stride、Lance MaPE temporal band、edit clean/noisy 位置复用和
+`MultiClipsFrameSampler` 的完整视频均匀抽帧语义也已逐项移植。
+仍待在目标镜像对真实权重和 parquet 执行完整 encode/pack 实机验收。
 
 ### II-4 并行、优化器与 checkpoint
 
@@ -141,21 +145,28 @@ MoT 路由。尚待在目标镜像加载生产 tokenizer/Wan-VAE 权重并跑真
 - ViT/VAE 冻结且不进入 optimizer，generation/understanding expert 分组可独立冻结；
 - 支持 activation checkpoint、BF16、distributed optimizer、DP/CP，TP/PP 在基线稳定后加入；
 - checkpoint 必须保存 dataloader cursor、混合采样 RNG、noise RNG、optimizer、scheduler、EMA；
-- 断点续训测试比较连续 20 step 与 10+resume+10 step 的 sample id、loss 和权重。
+- 断点续训测试比较连续 20 step 与 10+resume+10 step 的 packed batch path、loss、CE/MSE、LR、
+  梯度范数和 trainable 参数 checksum。
 
-当前已落地 AdamW、论文 warmup/constant/5-cycle cosine scheduler、gradient clipping、独立 EMA 模型、
-decoder activation checkpointing，以及包含 model/optimizer/EMA/数据游标/混合 RNG/noise RNG/
-scheduler 的 DCP state contract。EMA 以顶层 sharded model 保存，不会复制进每个 rank 的 extra state。
+当前已把原生 Lance 注册到 MindSpeed-MM 的 FSDP2 ModelHub，并使用通用 FSDP2 parallel applier、
+融合 AdamW、参数 prefetch、gradient clipping 与 stateful dataloader。Lance task engine 处理 joint
+CE/MSE、fail-fast non-finite、decoder activation checkpointing 和 sharded EMA；EMA 仅保存 trainable
+参数，不复制冻结 ViT/VAE/3D position table。DCP 包含 model、optimizer、EMA、scheduler、数据游标
+和 RNG state。
 
-为先获得可归因的训练基线，已落地官方 `train/unified_train.py` 的 Ascend 桥：启动前绑定 clean Lance
-revision、训练入口 SHA、数据 YAML SHA、初始化、论文超参、冻结/EMA 与 FSDP 拓扑；训练态 runtime
-补充 HCCL、NPU device mesh、autocast 和可反传 attention dropout；官方会吞掉 step 异常的 handler
-通过窄范围 AST 转换改为 fail-fast，且不修改上游文件。该路径只覆盖官方监督训练入口，不把它误标为
-原生 FSDP2，也不用于 strict-random 或 RL。
+PT 采用冻结编码器离线化：MindSpeed-MM 内置的 Qwen2.5-VL ViT 和 48-channel Wan2.2 VAE 对
+350K parquet 做一次编码，原生 sample builder 覆盖 T2I/T2V、I2T/V2T、I2I/V2V，随后按
+44K--50K token budget 生成 packed batch。训练模型因此可以完全移除常驻 ViT/VAE，只保留可训练
+connector；过长样本在预处理 manifest 中一次性剔除，不再占用训练进程数小时循环 skip。
 
-下一项是先在 8 NPU 上完成 PT 的 1 step/20 step/10+resume+10 闭环并记录 loss、吞吐、峰值内存和
-checkpoint 可恢复性；随后把已存在的原生 model/data/joint-loss/task-mixer/DCP 组件接入 MindSpeed-MM
-通用 FSDP2 TrainEngine，并以同一批次对比上游桥的 loss、梯度范数和一次参数更新。
+本轮训练入口不发现、不导入也不执行 Lance 官方 Git checkout。此前用于定位问题的官方
+`train/unified_train.py` Ascend 启动桥仅作为历史基线保留，不参与原生初始化、数据准备、训练或
+checkpoint 恢复；所有新增训练验收只接受 `mindspeed_mm/fsdp/tasks/lance/trainer.py` 产生的结果。
+
+下一项是在 8 NPU 上依次完成 native tiny 2-step、真实预编码 1-step/20-step、10+resume+10 闭环，
+记录 loss、吞吐、峰值内存和严格连续性。代码已提供逐 rank continuity trace 与比较器，短测中同时
+验证数据游标、RNG、optimizer、scheduler、EMA 和参数更新结果；当前 attention 已从逐 segment
+发射合并为每层最多两个 TND varlen kernel，实机确认数值与内存后再开始 CP/70K 压测。
 
 ## 阶段 III：论文训练阶段
 
@@ -182,21 +193,25 @@ T2I/T2V；CT-I/II/III 逐步提升 edit、subject-driven 和 I2V 占比；SFT �
 
 ## 当前状态
 
-- 已完成：官方推理桥接、HCCL/FlashAttention shim、七任务入口、五项论文 evaluation 的数据门禁、
+- 历史阶段已完成：官方推理桥接、HCCL/FlashAttention shim、七任务入口、五项论文 evaluation 的数据门禁、
   sampling/scorer/归一化/provenance/report；原生模型精确参数树、MoT forward/backward、3D 位置表、
   原生 Qwen2.5-VL ViT、packed attention 语义、NPU block/KV backend、KV-cached Euler/CFG sampler、
   joint CE/MSE step、官方 PackedDataset 适配、decoder activation checkpoint、论文与严格随机初始化、
-  PT/CT/SFT/RL stage manifest、streaming 权重加载、safetensors→DCP 转换与 metadata 回读；官方
-  监督训练 Ascend 基线桥、训练态 NPU runtime、严格启动 preflight 和 fail-fast 异常策略；
-- 本机已验证：115 项既有 Lance 单测、Python 编译、CLI help、git diff whitespace，以及 image/video
-  官方 safetensors 真实 header 和四套官方发布 evaluation 数据；torch 相关测试使用临时 CPU
-  torch 2.2.2，仅用于结构/梯度/算法语义验证，不代表目标 torch 2.7.1 + torch-npu 结果；
-- 本轮额外完成真实 clean Lance revision 上的 PT preflight：上游 revision、入口 SHA、dataset YAML
-  SHA、8 卡拓扑及论文参数均为 `ready`；当前系统无 pytest，新增用例已通过 Python 编译但尚未在完整
-  项目测试环境执行；
+  PT/CT/SFT/RL stage manifest、streaming 权重加载、safetensors→DCP 转换与 metadata 回读；
+- 当前原生分支已完成：MindSpeed-MM FSDP2 model/dataset/task 注册、Qwen 初始化 release DCP、原生
+  tokenizer/ViT/Wan-VAE 六类 PT 数据预编码、44K--50K packing、joint CE/MSE、跨 rank 空模态一致
+  graph、融合 AdamW、activation checkpoint、prefetch、trainable-only sharded EMA、DCP 严格恢复、
+  artifact preflight 和连续/恢复 trace 比较器；
+- 当前工作机没有 torch/pytest，只完成 Python 编译、shell 语法、dependency-free CLI 与 whitespace
+  校验；此前 CPU torch 测试记录不能替代本分支在目标 torch 2.7.1 + torch-npu 上的重新执行；
 - 当前阻塞于实机的项目：本机无 torch_npu、CANN、Ascend 设备、完整 checkpoint 和 scorer 权重，
   因此尚未执行真实 NPU kernel numerical/gradient test、七任务生成、全量 DCP 转换及论文分数；
-- 原生实现尚缺：生产 tokenizer/Wan-VAE 权重实载、CP/FSDP2 训练 runner、Ascend 10+resume 闭环、
-  70K 压测和多卡性能调优；这些不能以当前 CPU/fake-NPU 结构测试替代；
-- 进入原生训练开发前的硬门禁：阶段 I 的 NPU attention smoke 与至少 T2I、T2V、X2T 三条
-  checkpoint 推理通过，避免在未确认底层算子语义时扩大改动面。
+- 原生实现已具备：FSDP2 runner、Qwen 初始化 DCP、生产 tokenizer、原生 Qwen ViT/Wan2.2 VAE
+  离线编码、六类 example parquet sample builder、token-budget packer、joint loss、trainable-only EMA
+  和 DCP 严格恢复；packed loader 默认零 worker 规避 `/dev/shm` 放大，并支持 pinned-memory
+  non-blocking H2D 调优。仍待目标容器完成真实权重实载与 Ascend 10+resume 闭环；
+- 原生实现尚缺的扩展项：I2V/subject-driven/interleaved 通用预处理、CP/70K 压测，以及实机驱动的
+  TND packing/通信进一步调优；这些不能以当前静态测试替代；
+- 进入 350K 完整训练前的硬门禁：native tiny 2-step、真实 packed 1-step/20-step、
+  10+resume+10 连续性以及 44K batch 的吞吐/峰值内存均须在 8 NPU 通过；不能再用官方训练桥的
+  成功结果替代原生 FSDP2 门禁。

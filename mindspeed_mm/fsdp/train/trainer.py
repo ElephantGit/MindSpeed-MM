@@ -78,10 +78,14 @@ class Trainer():
         self._validate_and_set_train_iters(args)
 
         # Create the training engine
-        self.trainer = TrainEngine(
+        self.trainer = self.build_train_engine(
             args, self.train_dataloader, self.model, self.optimizer, self.lr_scheduler, self.checkpointer,
             lora_weight_manager=self.lora_weight_manager
         )
+
+    def build_train_engine(self, *args, **kwargs):
+        """Build the task engine; specialized native models may override it."""
+        return TrainEngine(*args, **kwargs)
 
     def _validate_and_set_train_iters(self, args: Arguments):
         # Calculate total training iterations based on epochs if specified

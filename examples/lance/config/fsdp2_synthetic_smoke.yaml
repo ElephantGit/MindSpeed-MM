@@ -1,0 +1,110 @@
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: auto
+  fsdp_plan:
+    apply_modules:
+      - language_model.model.layers.{*}
+      - language_model.model.embed_tokens
+      - language_model.model
+      - language_model.lm_head
+      - vae2llm
+      - llm2vae
+      - time_embedder
+    param_dtype: bf16
+    reduce_dtype: fp32
+    cast_forward_inputs: true
+    reshard_after_forward: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+  recompute: false
+  ulysses_parallel_size: 1
+
+data:
+  dataset_param:
+    dataset_type: native_lance
+    format: synthetic
+    length: 64
+    seed: 2025
+    native_config: &TINY_LANCE_CONFIG
+      variant: image
+      vocab_size: 97
+      hidden_size: 32
+      intermediate_size: 64
+      num_hidden_layers: 2
+      num_attention_heads: 4
+      num_key_value_heads: 2
+      max_position_embeddings: 256
+      rope_theta: 10000.0
+      mrope_section: [1, 1, 2]
+      latent_channels: 8
+      latent_patch_size: [1, 1, 1]
+      max_latent_size: 4
+      max_num_frames: 1
+      vit_depth: 2
+      vit_hidden_size: 16
+      vit_intermediate_size: 32
+      vit_num_heads: 4
+      vit_in_channels: 3
+      vit_patch_size: 2
+      vit_temporal_patch_size: 2
+      vit_spatial_merge_size: 2
+      vit_window_size: 8
+      vit_fullatt_block_indexes: [0]
+      vit_out_hidden_size: 32
+    basic_parameters:
+      dataset: synthetic
+    preprocess_parameters: {}
+  dataloader_param:
+    dataloader_mode: sampler
+    sampler_type: BaseRandomBatchSampler
+    shuffle: true
+    drop_last: true
+    pin_memory: true
+    num_workers: 0
+    collate_param:
+      model_name: lance
+
+model:
+  model_id: lance
+  native_config_only: true
+  variant: image
+  native_config: *TINY_LANCE_CONFIG
+  init_mode: random
+  init_seed: 2025
+  gradient_checkpointing: true
+  ce_weight: 0.25
+  mse_weight: 1.0
+  timestep_shift: 1.0
+  validate_batches: true
+  use_ema: true
+  ema_decay: 0.9999
+  loss_cfg:
+    loss_type: raw
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  seed: 2025
+  lr: 1.0e-4
+  lr_decay_style: constant
+  lr_warmup_ratio: 0.1
+  weight_decay: 0.0
+  train_iters: 2
+  clip_grad: 1.0
+  optimizer: adamw
+  adam_fused: true
+  init_model_with_meta_device: false
+  log_interval: 1
+  trace_file: ${LANCE_TRACE_FILE}
+  save_interval: 2
+  save: ${LANCE_SYNTHETIC_OUTPUT}
+  use_deter_comp: false
+  plugin:
+    - mindspeed_mm/fsdp/models/lance
+    - mindspeed_mm/fsdp/data/datasets/lance
+
+tools:
+  profile:
+    enable: false
+  memory_profile:
+    enable: false

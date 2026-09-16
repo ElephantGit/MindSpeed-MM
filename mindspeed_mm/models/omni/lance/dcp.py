@@ -44,6 +44,17 @@ def _require_reader() -> Tuple[Any, Any]:
     return torch, FileSystemReader
 
 
+def _require_writer() -> Tuple[Any, Any]:
+    try:
+        from torch.distributed.checkpoint import FileSystemWriter
+        from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
+    except ImportError as exc:
+        raise LanceDCPError(
+            "native DCP writing requires torch.distributed.checkpoint"
+        ) from exc
+    return FileSystemWriter, _save_state_dict
+
+
 def _shape_tuple(value: Any) -> Tuple[int, ...]:
     return tuple(int(item) for item in value)
 
@@ -61,6 +72,48 @@ def _ensure_new_directory(path: Path) -> None:
         if any(path.iterdir()):
             raise LanceDCPError("refusing to overwrite non-empty DCP directory: {}".format(path))
     path.mkdir(parents=True, exist_ok=True)
+
+
+def write_native_state_to_dcp(
+    state_dict: Mapping[str, Any],
+    output_dir: Union[str, Path],
+    *,
+    iteration: str = "release",
+    manifest: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Write an initialized native model tree as a MindSpeed-MM release DCP."""
+
+    root = Path(output_dir).expanduser().resolve()
+    if not state_dict:
+        raise LanceDCPError("cannot write an empty native model state")
+    meta = [name for name, value in state_dict.items() if getattr(value, "is_meta", False)]
+    if meta:
+        raise LanceDCPError("cannot write meta tensors to DCP: {}".format(meta[0]))
+    FileSystemWriter, save_state_dict = _require_writer()
+    _ensure_new_directory(root)
+    checkpoint_dir = root / iteration
+    checkpoint_dir.mkdir(parents=False, exist_ok=False)
+
+    save_state_dict(
+        {"model": dict(state_dict)},
+        storage_writer=FileSystemWriter(str(checkpoint_dir)),
+        no_dist=True,
+    )
+    (root / "latest_checkpointed_iteration.txt").write_text(iteration, encoding="utf-8")
+    report = {
+        "schema_version": 1,
+        "status": "completed",
+        "mode": "native-mindspeed-mm-initialization",
+        "target": str(checkpoint_dir),
+        "iteration": iteration,
+        "tensor_count": len(state_dict),
+    }
+    if manifest:
+        report["initialization"] = dict(manifest)
+    (root / "lance_native_initialization.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return report
 
 
 def _validate_loaded_state(

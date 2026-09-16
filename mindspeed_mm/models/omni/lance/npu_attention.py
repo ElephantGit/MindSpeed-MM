@@ -2,13 +2,13 @@
 
 The generalized Lance mask cannot be represented by one ordinary causal call:
 visual spans are bidirectional and noisy target spans must never leak into later
-KV.  This baseline decomposes a packed document by query segment.  Each kernel
-sees all earlier clean KV plus the current segment; causal text uses right-down
-causal alignment, while visual/noise segments use full attention.
+KV.  The schedule decomposes each document by query segment, then coalesces all
+causal segments and all full/noise segments into at most two TND varlen kernels
+per layer.  Every sequence sees earlier clean KV plus its current segment;
+causal text uses right-down alignment, while visual/noise spans use full attention.
 
-No ``[sequence, sequence]`` mask is allocated, so the implementation is safe for
-the 70K context target.  A later optimization may coalesce compatible segments
-without changing this contract.
+No ``[sequence, sequence]`` mask is allocated, so the implementation remains
+compatible with the 70K context target.
 """
 
 from collections import OrderedDict
@@ -357,40 +357,73 @@ class AscendBlockAttentionBackend:
             )
         output = torch.empty_like(query)
         scale = 1.0 / math.sqrt(query.shape[-1])
+        batched = {True: [], False: []}
         covered = 0
         for (query_start, query_end), blocks in groups:
-            query_slice = query[query_start:query_end]
-            key_slice = torch.cat([key[block.key_start:block.key_end] for block in blocks], dim=0)
-            value_slice = torch.cat([value[block.key_start:block.key_end] for block in blocks], dim=0)
             self_block = blocks[-1]
             if (self_block.key_start, self_block.key_end) != (query_start, query_end):
                 raise LanceAscendAttentionError("compiled schedule must end with the query self-block")
             causal = self_block.causal
+            batched[causal].append((query_start, query_end, blocks))
+            covered += query_end - query_start
+        if covered != query.shape[0]:
+            raise LanceAscendAttentionError("compiled attention schedule did not cover every query token")
+
+        for causal in (True, False):
+            plans = batched[causal]
+            if not plans:
+                continue
+            query_parts = []
+            key_parts = []
+            value_parts = []
+            query_lengths = []
+            key_lengths = []
+            query_total = 0
+            key_total = 0
+            for query_start, query_end, blocks in plans:
+                query_part = query[query_start:query_end]
+                key_part = torch.cat(
+                    [key[block.key_start:block.key_end] for block in blocks], dim=0
+                )
+                value_part = torch.cat(
+                    [value[block.key_start:block.key_end] for block in blocks], dim=0
+                )
+                query_parts.append(query_part)
+                key_parts.append(key_part)
+                value_parts.append(value_part)
+                query_total += query_part.shape[0]
+                key_total += key_part.shape[0]
+                query_lengths.append(query_total)
+                key_lengths.append(key_total)
+            packed_query = torch.cat(query_parts, dim=0).contiguous()
+            packed_key = torch.cat(key_parts, dim=0).contiguous()
+            packed_value = torch.cat(value_parts, dim=0).contiguous()
             result = self.torch_npu.npu_fusion_attention(
-                query_slice,
-                key_slice,
-                value_slice,
+                packed_query,
+                packed_key,
+                packed_value,
                 head_num=query.shape[1],
                 input_layout="TND",
                 pse=None,
                 padding_mask=None,
-                atten_mask=self._causal_mask(query_slice) if causal else None,
+                atten_mask=self._causal_mask(packed_query) if causal else None,
                 scale=scale,
                 keep_prob=1.0,
                 pre_tockens=2147483647,
                 next_tockens=2147483647,
-                actual_seq_qlen=(query_end - query_start,),
-                actual_seq_kvlen=(key_slice.shape[0],),
+                actual_seq_qlen=tuple(query_lengths),
+                actual_seq_kvlen=tuple(key_lengths),
                 sparse_mode=3 if causal else 0,
             )[0]
-            if result.shape != query_slice.shape:
+            if result.shape != packed_query.shape:
                 raise LanceAscendAttentionError(
                     "npu_fusion_attention returned {}, expected {}".format(
-                        tuple(result.shape), tuple(query_slice.shape)
+                        tuple(result.shape), tuple(packed_query.shape)
                     )
                 )
-            output[query_start:query_end] = result
-            covered += query_end - query_start
-        if covered != query.shape[0]:
-            raise LanceAscendAttentionError("compiled attention schedule did not cover every query token")
+            cursor = 0
+            for query_start, query_end, _ in plans:
+                length = query_end - query_start
+                output[query_start:query_end] = result[cursor:cursor + length]
+                cursor += length
         return output

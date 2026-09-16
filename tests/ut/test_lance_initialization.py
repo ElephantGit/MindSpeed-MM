@@ -10,6 +10,7 @@ from mindspeed_mm.models.omni.lance.initialization import (
     LanceInitializationError,
     copy_understanding_to_generation,
     initialize_from_qwen_vl_state_dict,
+    initialize_from_qwen_vl_files,
     initialize_random,
     load_native_lance_checkpoint,
     qwen_vl_target_name,
@@ -123,3 +124,56 @@ def test_native_checkpoint_loader_refuses_meta_destination(tmp_path):
     target = LanceNativeModel(_config(), device="meta", dtype=torch.bfloat16)
     with pytest.raises(LanceInitializationError, match="materialized"):
         load_native_lance_checkpoint(target, checkpoint)
+
+
+def test_qwen_file_initialization_streams_and_copies_generation(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    model = LanceNativeModel(_config())
+    qwen = tmp_path / "qwen"
+    qwen.mkdir()
+    source = {
+        "model.layers.0.self_attn.q_proj.weight": torch.full((32, 32), 0.375),
+        "model.embed_tokens.weight": torch.full((31, 32), 0.25),
+    }
+    safetensors.save_file(source, str(qwen / "model.safetensors"))
+    report = initialize_from_qwen_vl_files(
+        model, qwen, require_complete=False
+    )
+    assert report["streaming"] is True
+    assert report["loaded_count"] == 2
+    layer = model.language_model.model.layers[0]
+    torch.testing.assert_close(layer.self_attn.q_proj.weight, source["model.layers.0.self_attn.q_proj.weight"])
+    torch.testing.assert_close(layer.self_attn.q_proj_moe_gen.weight, layer.self_attn.q_proj.weight)
+
+
+def test_qwen_file_initialization_materializes_omitted_tied_lm_head(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    model = LanceNativeModel(_config())
+    qwen = tmp_path / "qwen"
+    qwen.mkdir()
+    (qwen / "config.json").write_text(
+        '{"tie_word_embeddings": true}', encoding="utf-8"
+    )
+    source = {}
+    for name, parameter in model.named_parameters():
+        if not name.startswith("language_model."):
+            continue
+        source_name = name.removeprefix("language_model.")
+        if (
+            source_name == "lm_head.weight"
+            or "_moe_gen" in source_name
+            or ".q_norm." in source_name
+            or ".k_norm." in source_name
+        ):
+            continue
+        source[source_name] = torch.full_like(parameter, 0.375)
+    safetensors.save_file(source, str(qwen / "model.safetensors"))
+
+    report = initialize_from_qwen_vl_files(model, qwen)
+
+    assert report["missing_required"] == []
+    assert report["tied_lm_head_source"]["source"] == "model.embed_tokens.weight"
+    torch.testing.assert_close(
+        model.language_model.lm_head.weight,
+        model.language_model.model.embed_tokens.weight,
+    )
