@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -220,14 +220,19 @@ def initialize_from_qwen_vl_files(
     vit_path: Optional[Union[str, Path]] = None,
     copy_generation_expert: bool = True,
     require_complete: bool = True,
+    zero_init_missing_biases: bool = True,
 ) -> Dict[str, Any]:
-    """Stream Qwen2.5-VL and optional extracted ViT weights into Lance.
+    """Stream Qwen2.5-VL / Qwen3 weights and optional ViT weights into Lance.
 
     This is the native replacement for constructing an upstream Transformers
     Lance model and then handing it to an external trainer.  At most one source
     tensor is materialized at a time.  The separate ``vit_path`` is useful for
     the released ``Qwen2.5-VL-ViT/vit.safetensors`` artifact and deliberately
     takes precedence over any visual tensors in the full VLM directory.
+
+    Sources without attention biases (e.g. Qwen3 uses ``attention_bias=false``)
+    get their missing q/k/v biases zero-initialized, which reproduces the
+    no-bias source model exactly while keeping the Lance parameter tree fixed.
     """
 
     if any(parameter.is_meta for parameter in model.parameters()):
@@ -307,9 +312,10 @@ def initialize_from_qwen_vl_files(
 
     # These parameters are Lance additions and intentionally retain their
     # seeded native initialization.  All ordinary understanding-side Qwen and
-    # frozen ViT parameters must be sourced from the requested checkpoints.
+    # frozen ViT parameters (including q_norm/k_norm, which both Qwen2.5-VL
+    # and Qwen3 ship) must be sourced from the requested checkpoints.
     native_only_fragments = (
-        "_moe_gen", ".q_norm.", ".k_norm.", "vae2llm.", "llm2vae.",
+        "_moe_gen", "vae2llm.", "llm2vae.",
         "time_embedder.", "latent_pos_embed.", "connector.",
     )
     required = {
@@ -317,6 +323,18 @@ def initialize_from_qwen_vl_files(
         if not any(fragment in name for fragment in native_only_fragments)
     }
     missing_required = sorted(required - set(loaded))
+    zero_initialized_biases: List[str] = []
+    if zero_init_missing_biases and missing_required:
+        zero_initialized_biases = sorted(
+            name for name in missing_required if name.endswith(".bias")
+        )
+        if zero_initialized_biases:
+            with torch.no_grad():
+                for name in zero_initialized_biases:
+                    targets[name].zero_()
+            missing_required = sorted(
+                set(missing_required) - set(zero_initialized_biases)
+            )
     if require_complete and missing_required:
         raise LanceInitializationError(
             "Qwen initialization did not provide {} required tensors; first: {}".format(
@@ -332,6 +350,7 @@ def initialize_from_qwen_vl_files(
         "loaded_count": len(loaded),
         "required_count": len(required),
         "missing_required": missing_required,
+        "zero_initialized_biases": zero_initialized_biases,
         "unexpected": unexpected,
         "unexpected_count": len(unexpected),
         "generation_expert": expert_report,

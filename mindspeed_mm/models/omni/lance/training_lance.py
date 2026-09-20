@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .modeling_lance import LanceNativeModel
+from .debug_hooks import hook_forward_inputs, hook_losses, hook_step, remember_batch
 from .sequence import LancePackedSequence
 
 
@@ -226,6 +227,8 @@ def lance_training_step(
 
     if validate:
         batch.validate(model)
+    # LANCE_DEBUG=1 instrumentation: dumps token/mask composition. No-op otherwise.
+    hook_forward_inputs(model, batch)
     embedded_tokens = model.language_model.model.embed_tokens(batch.token_ids)
     hidden_inputs = embedded_tokens.new_zeros((batch.sequence_length, model.config.hidden_size))
     hidden_inputs[batch.text_indexes] = embedded_tokens[batch.text_indexes]
@@ -335,6 +338,9 @@ def lance_training_step(
         total_loss = total_loss + loss_weights.mse * mse_loss
     if ce_loss is None and mse_loss is None:
         raise LanceTrainingError("a training batch must select CE or MSE loss tokens")
+
+    # LANCE_DEBUG=1 instrumentation: dumps the loss decomposition. No-op otherwise.
+    hook_losses(batch, ce_loss, mse_loss, ce_weight, mse_weight, total_loss)
 
     return {
         "loss": total_loss,

@@ -14,7 +14,7 @@
 
 
 import math
-from typing import TYPE_CHECKING, Dict, Literal
+from typing import TYPE_CHECKING, Dict, Literal, Optional
 import logging
 
 from torch.optim.lr_scheduler import LambdaLR
@@ -63,6 +63,7 @@ def build_lr_scheduler(
     lr_warmup_ratio: float = 0.0,
     lr_min: float = 1e-7,
     lr_start: float = 0.0,
+    lr_warmup_steps: Optional[int] = None,
 ):
     # Handle MultiOptimizer by creating one scheduler per underlying optimizer
     if hasattr(optimizer, "_is_multi_optimizer") or isinstance(optimizer, dict):
@@ -77,10 +78,16 @@ def build_lr_scheduler(
                 lr_warmup_ratio=lr_warmup_ratio,
                 lr_min=lr_min,
                 lr_start=lr_start,
+                lr_warmup_steps=lr_warmup_steps,
             )
         return MultiLRScheduler(schedulers)
 
-    lr_warmup_steps = int(train_steps * lr_warmup_ratio)
+    if lr_warmup_steps is None:
+        lr_warmup_steps = int(train_steps * lr_warmup_ratio)
+    else:
+        lr_warmup_steps = int(lr_warmup_steps)
+    if not 0 <= lr_warmup_steps <= train_steps:
+        raise ValueError("lr_warmup_steps must be in [0, train_steps]")
     if lr_decay_style == "constant":
         return get_constant_schedule_with_warmup(
             optimizer=optimizer,

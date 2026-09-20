@@ -283,6 +283,7 @@ class Trainer():
             lr_decay_ratio=args.training.lr_decay_ratio,
             lr_warmup_ratio=args.training.lr_warmup_ratio,
             lr_start=args.training.lr_start,
+            lr_warmup_steps=args.training.lr_warmup_steps,
         )
         return lr_scheduler
 

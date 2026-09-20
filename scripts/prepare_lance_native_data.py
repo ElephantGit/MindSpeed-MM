@@ -33,7 +33,6 @@ from mindspeed_mm.models.omni.lance.preprocessing import (
     build_edit_sample,
     build_generation_sample,
     build_understanding_sample,
-    lance_system_prompt,
     patchify_qwen_video,
     prepare_lance_tokenizer,
 )
@@ -63,6 +62,12 @@ def parse_arguments():
     )
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--text-cond-dropout-prob", type=float, default=0.1)
+    parser.add_argument(
+        "--emit-tasks",
+        help="Comma list of tasks to emit per generation-schema row, e.g. t2i,i2t "
+             "(t2i/t2v rows can additionally emit their i2t/v2t twin). "
+             "Default: only the schema-detected task",
+    )
     parser.add_argument("--sample-posterior", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--resample-posterior-during-training",
@@ -274,18 +279,13 @@ def _task(path, row):
     raise ValueError("unrecognized Lance example row schema: {}".format(sorted(keys)))
 
 
-def _caption_triplet(row, modality, choice):
+def _caption_answer(row):
     if "caption_a" in row:
-        return (
-            str(row.get("caption_i", "")).strip(),
-            str(row.get("caption_q", "")).strip(),
-            str(row["caption_a"]),
-        )
-    return (
-        lance_system_prompt("caption", modality, choice),
-        "",
-        str(row.get("caption", "")),
-    )
+        return str(row.get("caption_q", "")).strip(), str(row["caption_a"])
+    return "", str(row.get("caption", ""))
+
+
+_UNDERSTANDING_TWIN = {"t2i": "i2t", "t2v": "v2t"}
 
 
 def _stable_number(sample_id, seed, namespace):
@@ -294,53 +294,82 @@ def _stable_number(sample_id, seed, namespace):
 
 
 def _prepare(
-    path, row, sample_id, encoder, tokenizer, config, *, seed, text_dropout
+    path, row, sample_id, encoder, tokenizer, config, *, seed, text_dropout,
+    emit_tasks=None,
 ):
-    task = _task(path, row)
-    if task in ("t2i", "t2v"):
-        modality, key = ("image", "image_bytes") if task == "t2i" else ("video", "video_bytes")
-        target = encoder.visual(row[key], modality, need_vit=False, need_vae=True)
-        dropout_draw = _stable_number(sample_id, seed, "text-dropout") / 2**64
-        caption = None if dropout_draw < text_dropout else row["caption"]
-        generation_task = task
-        condition_frames = ()
-        if task == "t2v":
-            # Match train_local's task_type_rate=[0.8, 0.2] for t2v/ff2v.
-            variant_draw = _stable_number(sample_id, seed, "video-task") / 2**64
-            if variant_draw >= 0.8:
-                generation_task = "ff2v"
-                condition_frames = (0,)
-        return generation_task, build_generation_sample(
-            sample_id,
-            caption,
-            target,
-            tokenizer,
-            config,
-            system_prompt=lance_system_prompt(task, modality),
-            condition_frames=condition_frames,
+    """Return the list of (task, sample) pairs requested for one source row.
+
+    ``emit_tasks=None`` keeps the schema-detected task only.  Generation-schema
+    rows (t2i/t2v) may additionally emit their understanding twin (i2t/v2t)
+    from the same media: one frozen-encoder pass produces both the VAE target
+    and the ViT condition, and caption dropout only ever applies to the
+    generation half.
+    """
+
+    base_task = _task(path, row)
+    requested = emit_tasks if emit_tasks is not None else {base_task}
+    results = []
+    if base_task in ("t2i", "t2v"):
+        modality, key = ("image", "image_bytes") if base_task == "t2i" else ("video", "video_bytes")
+        twin = _UNDERSTANDING_TWIN[base_task]
+        visual = encoder.visual(
+            row[key], modality, need_vit=twin in requested, need_vae=True
         )
-    if task in ("i2t", "v2t"):
-        modality, key = ("image", "image_bytes") if task == "i2t" else ("video", "video_bytes")
+        if base_task in requested:
+            target = LanceEncodedVisual(
+                modality,
+                vae_latent=visual.vae_latent,
+                vae_log_variance=visual.vae_log_variance,
+            )
+            dropout_draw = _stable_number(sample_id, seed, "text-dropout") / 2**64
+            caption = None if dropout_draw < text_dropout else row["caption"]
+            generation_task = base_task
+            condition_frames = ()
+            if base_task == "t2v":
+                # Match train_local's task_type_rate=[0.8, 0.2] for t2v/ff2v.
+                variant_draw = _stable_number(sample_id, seed, "video-task") / 2**64
+                if variant_draw >= 0.8:
+                    generation_task = "ff2v"
+                    condition_frames = (0,)
+            results.append((generation_task, build_generation_sample(
+                sample_id,
+                caption,
+                target,
+                tokenizer,
+                config,
+                condition_frames=condition_frames,
+            )))
+        if twin in requested:
+            condition = LanceEncodedVisual(
+                modality,
+                vit_embedding=visual.vit_embedding,
+                vit_grid_thw=visual.vit_grid_thw,
+            )
+            prompt, answer = _caption_answer(row)
+            results.append((twin, build_understanding_sample(
+                "{}:{}".format(sample_id, twin), prompt, answer, condition,
+                tokenizer, config,
+            )))
+        return results
+    if base_task in ("i2t", "v2t"):
+        modality, key = ("image", "image_bytes") if base_task == "i2t" else ("video", "video_bytes")
         condition = encoder.visual(
             row[key], modality, need_vit=True, need_vae=False,
             max_duration=2 if modality == "video" else 6,
         )
-        choice = _stable_number(sample_id, seed, "caption-system")
-        system, prompt, answer = _caption_triplet(row, modality, choice)
-        return task, build_understanding_sample(
+        prompt, answer = _caption_answer(row)
+        return [(base_task, build_understanding_sample(
             sample_id, prompt, answer, condition, tokenizer, config,
-            system_prompt=system,
-        )
-    if task == "i2i":
+        ))]
+    if base_task == "i2i":
         condition = encoder.visual(row["input_image_bytes"], "image", need_vit=True, need_vae=True, edit=True)
         target = encoder.visual(row["output_image_bytes"], "image", need_vit=False, need_vae=True, edit=True)
     else:
         condition = encoder.visual(row["input_video_bytes"], "video", need_vit=True, need_vae=True, edit=True)
         target = encoder.visual(row["output_video_bytes"], "video", need_vit=False, need_vae=True, edit=True)
-    return task, build_edit_sample(
+    return [(base_task, build_edit_sample(
         sample_id, row["caption"], condition, target, tokenizer, config,
-        system_prompt=lance_system_prompt("edit", target.modality),
-    )
+    ))]
 
 
 def main():
@@ -349,6 +378,13 @@ def main():
         raise ValueError("max-failure-rate must be in [0, 1]")
     if not 0.0 <= args.text_cond_dropout_prob <= 1.0:
         raise ValueError("text-cond-dropout-prob must be in [0, 1]")
+    if args.emit_tasks:
+        emit_tasks = {item.strip() for item in args.emit_tasks.split(",") if item.strip()}
+        unknown = emit_tasks - {"t2i", "t2v", "i2t", "v2t", "i2i", "v2v"}
+        if unknown:
+            raise ValueError("unsupported --emit-tasks entries: {}".format(sorted(unknown)))
+    else:
+        emit_tasks = None
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     device = _device()
@@ -409,18 +445,20 @@ def main():
                         and base_task_counts.get(base_task, 0) >= args.max_samples_per_task
                     ):
                         continue
-                    task, sample = _prepare(
+                    prepared = _prepare(
                         path, row, sample_id, encoder, tokenizer, config,
                         seed=args.seed,
                         text_dropout=args.text_cond_dropout_prob,
+                        emit_tasks=emit_tasks,
                     )
-                    sample.validate(config)
-                    task_output = output / task
-                    task_output.mkdir(parents=True, exist_ok=True)
-                    torch.save(sample, task_output / "sample-{:08d}.pt".format(written))
-                    counts[task] = counts.get(task, 0) + 1
+                    for task, sample in prepared:
+                        sample.validate(config)
+                        task_output = output / task
+                        task_output.mkdir(parents=True, exist_ok=True)
+                        torch.save(sample, task_output / "sample-{:08d}.pt".format(written))
+                        counts[task] = counts.get(task, 0) + 1
+                        written += 1
                     base_task_counts[base_task] = base_task_counts.get(base_task, 0) + 1
-                    written += 1
                 except Exception as exc:
                     failures.append({"sample_id": sample_id, "error": str(exc)})
                     if args.fail_fast:
@@ -443,6 +481,8 @@ def main():
         "vit_path": str(Path(args.vit_path).expanduser().resolve()),
         "vae_path": str(Path(args.vae_path).expanduser().resolve()),
         "text_cond_dropout_prob": args.text_cond_dropout_prob,
+        "text_format": "raw-pt",
+        "emit_tasks": sorted(emit_tasks) if emit_tasks else None,
         "resample_posterior_during_training": args.resample_posterior_during_training,
         "dataset_root": str(root),
         "parquet_files": len(files),

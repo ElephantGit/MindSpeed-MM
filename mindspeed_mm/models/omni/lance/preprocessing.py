@@ -1,9 +1,11 @@
 """Native construction of Lance training samples from frozen media features.
 
-The prompt renderer and visual-span expansion below are a dependency-free port
-of Lance's Apache-2.0 ``system_prompt_render.py`` semantics.  In particular,
-the official training path uses Qwen's video-pad token for both image and video
-spans and applies CE only after the ``assistant\n`` marker.
+Raw pretraining samples are assembled from independent modality segments, as
+in BAGEL and Lance's template-free data path.  Every text segment is delimited
+by ``<|im_start|> ... <|im_end|>`` and every visual segment by
+``<|vision_start|> ... <|vision_end|>``.  Understanding CE starts at the
+target text segment's ``<|im_start|>`` position, which predicts its first text
+token; the final text token predicts ``<|im_end|>``.
 """
 
 from dataclasses import dataclass
@@ -53,70 +55,6 @@ def prepare_lance_tokenizer(tokenizer):
         tokenizer.add_tokens(missing)
     LanceSpecialTokens.from_tokenizer(tokenizer)
     return tokenizer
-
-
-_CAPTION_SYSTEM_PROMPTS = (
-    "Generate a detailed and accurate description of the {vision}, including all the key moments and visual details.",
-    "Write an in-depth depiction of the {vision}, covering all its aspects.",
-    "Write an exhaustive depiction of the given {vision}, capturing its essence and key moments.",
-    "Describe the key features of the input {vision}, including color, shape, size, texture, objects, background.",
-)
-
-
-def lance_system_prompt(prompt_type: str, vision_type: str, choice: int = 0) -> str:
-    """Return one of the system prompts used by the official PT datasets."""
-
-    if prompt_type == "caption":
-        candidates = _CAPTION_SYSTEM_PROMPTS
-    elif prompt_type in ("t2v", "i2v"):
-        candidates = (
-            "Describe the {vision} by detailing the color, quantity, visible text, shape, size, texture, "
-            "spatial relationships and motion/camera movements of the objects and background:",
-        )
-    elif prompt_type == "t2i":
-        candidates = (
-            "Describe the {vision} by detailing the color, quantity, text, shape, size, texture, "
-            "spatial relationships of the objects and background:",
-        )
-    elif "edit" in prompt_type:
-        candidates = (
-            "Describe the key features of the input {vision} (color, shape, size, texture, objects, "
-            "background), then explain how the user’s text instruction should alter or modify the "
-            "{vision}. Generate a new {vision} that meets the user’s requirements while maintaining "
-            "consistency with the original input where appropriate.",
-        )
-    else:
-        raise ValueError("unsupported Lance system-prompt type: {}".format(prompt_type))
-    return candidates[int(choice) % len(candidates)].format(vision=vision_type)
-
-
-def _render_chat(system_prompt: str, user_content: str, assistant_content: str) -> str:
-    """Render the exact two-turn Qwen template used by Lance PT."""
-
-    return (
-        "<|im_start|>system\n{}<|im_end|>\n"
-        "<|im_start|>user\n{}<|im_end|>\n"
-        "<|im_start|>assistant\n{}<|im_end|>"
-    ).format(system_prompt, user_content, assistant_content)
-
-
-def _visual_placeholder(modality: str) -> str:
-    # The official renderer intentionally uses video_pad for image as well.
-    if modality not in ("image", "video"):
-        raise ValueError("visual placeholder modality must be image or video")
-    return "<|vision_start|><|video_pad|><|vision_end|>"
-
-
-def _find_subsequence(values: List[int], needle: List[int], *, reverse: bool = False) -> int:
-    if not needle:
-        raise ValueError("cannot search for an empty token subsequence")
-    candidates = range(len(values) - len(needle), -1, -1) if reverse else range(
-        len(values) - len(needle) + 1
-    )
-    for start in candidates:
-        if values[start:start + len(needle)] == needle:
-            return start
-    raise ValueError("Qwen assistant marker was not found in rendered prompt")
 
 
 @dataclass(frozen=True)
@@ -288,14 +226,24 @@ class _SampleAssembler:
         self.ce_labels: List[int] = []
         self.ce_weights: List[float] = []
         self.mse_indexes: List[int] = []
+        self.visual_spans = []
+        self.visual_specs = []
         self.position_ids: Optional[torch.Tensor] = None
 
     def _add_vit_payload(self, visual: LanceEncodedVisual, payload: int) -> None:
         embedding = visual.vit_embedding
         if embedding is None:
             raise ValueError("ViT condition is missing its embedding")
-        if embedding.shape[1] != self.config.hidden_size:
-            raise ValueError("ViT output width does not match Lance hidden size")
+        # Frozen Qwen ViT merger output is vit_out_hidden_size wide; when the
+        # LLM hidden size differs the trainable connector projects it at
+        # training time.  Both widths are therefore valid in packed data.
+        allowed_widths = (self.config.hidden_size, self.config.vit_out_hidden_size)
+        if embedding.shape[1] not in allowed_widths:
+            raise ValueError(
+                "ViT output width {} does not match the Lance ViT contract {}".format(
+                    embedding.shape[1], allowed_widths
+                )
+            )
         self.vit_indexes.extend(range(payload, payload + embedding.shape[0]))
         self.vit_embeddings.append(embedding.to(device="cpu", dtype=torch.bfloat16))
 
@@ -364,131 +312,89 @@ class _SampleAssembler:
             self.mse_indexes.extend(indexes[offset] for offset in target_offsets)
         self.timesteps.append(timestep)
 
-    def add_chat(
-        self,
-        system_prompt: str,
-        user_content: str,
-        assistant_content: str,
-        visuals,
-        *,
-        assistant_ce: bool,
-    ) -> None:
-        """Tokenize one official Lance chat template and install media spans.
+    def add_text(self, text: str, *, target: bool = False) -> None:
+        """Append one independently delimited raw text segment."""
 
-        ``visuals`` is ordered by placeholder occurrence and contains
-        ``(visual, encoder_kind, is_target)`` tuples.  Encoder kind is ``vit``
-        or ``vae``; only target VAE spans select flow-matching loss.
-        """
-
-        if self.token_ids:
-            raise ValueError("one Lance prepared sample must contain exactly one rendered chat")
-        placeholder = _visual_placeholder("video")
-        rendered = _render_chat(system_prompt, user_content, assistant_content)
-        if rendered.count(placeholder) != len(visuals):
-            raise ValueError("rendered visual placeholders do not match encoded visual inputs")
-        normalized_visuals = []
-        for item in visuals:
-            if len(item) == 3:
-                visual, encoder_kind, target = item
-                condition_frames = ()
-            elif len(item) == 4:
-                visual, encoder_kind, target, condition_frames = item
-            else:
-                raise ValueError("visual entries must contain 3 or 4 fields")
-            normalized_visuals.append(
-                (visual, encoder_kind, target, condition_frames)
-            )
-        for visual, encoder_kind, _, _ in normalized_visuals:
-            if encoder_kind == "vit":
-                count = 0 if visual.vit_embedding is None else int(visual.vit_embedding.shape[0])
-            elif encoder_kind == "vae":
-                latent = visual.vae_latent
-                if latent is None:
-                    count = 0
-                else:
-                    patch_t, patch_h, patch_w = self.config.latent_patch_size
-                    count = (
-                        int(latent.shape[0]) // patch_t
-                        * (int(latent.shape[1]) // patch_h)
-                        * (int(latent.shape[2]) // patch_w)
-                    )
-            else:
-                raise ValueError("visual encoder kind must be vit or vae")
-            if count <= 0:
-                raise ValueError("encoded visual span must contain at least one token")
-            expanded = (
-                "<|vision_start|>" + "<|video_pad|>" * count + "<|vision_end|>"
-            )
-            rendered = rendered.replace(placeholder, expanded, 1)
-
-        ids = list(self.tokenizer.encode(rendered.strip(), add_special_tokens=False))
-        self.token_ids.extend(ids)
-        spans = []
-        cursor = 0
-        while cursor < len(ids):
-            try:
-                start = ids.index(self.tokens.vision_start, cursor)
-            except ValueError:
-                break
-            end = start + 1
-            while end < len(ids) and ids[end] == self.tokens.video_pad:
-                end += 1
-            if end == start + 1 or end >= len(ids) or ids[end] != self.tokens.vision_end:
-                raise ValueError("rendered prompt contains a malformed visual token span")
-            spans.append((start, start + 1, end))
-            cursor = end + 1
-        if len(spans) != len(visuals):
-            raise ValueError("tokenized visual spans do not match encoded visual inputs")
-        self.position_ids = _qwen_mrope_positions(
-            len(ids), spans, normalized_visuals, self.config
+        text_ids = list(self.tokenizer.encode(str(text), add_special_tokens=False))
+        start = len(self.token_ids)
+        segment_ids = [self.tokens.im_start] + text_ids + [self.tokens.im_end]
+        self.token_ids.extend(segment_ids)
+        self.text_indexes.extend(range(start, start + len(segment_ids)))
+        self.segments.append(
+            LanceSegment(len(segment_ids), "causal", "text", "understanding")
         )
-
-        cursor = 0
-        for (start, payload, end), (visual, encoder_kind, target, condition_frames) in zip(
-            spans, normalized_visuals
-        ):
-            if start > cursor:
-                length = start - cursor
-                self.text_indexes.extend(range(cursor, start))
-                self.segments.append(LanceSegment(length, "causal", "text", "understanding"))
-            length = end - start + 1
-            self.text_indexes.extend((start, end))
-            if encoder_kind == "vit":
-                if target:
-                    raise ValueError("ViT spans cannot be flow-matching targets")
-                self._add_vit_payload(visual, payload)
-                mode, modality, expert = "full", "vit", "understanding"
-            else:
-                self._add_vae_payload(
-                    visual, payload, target=target,
-                    condition_frames=condition_frames,
-                )
-                mode, modality, expert = (
-                    "noise" if target else "full_noise"
-                ), "vae", "generation"
-            self.segments.append(LanceSegment(length, mode, modality, expert))
-            cursor = end + 1
-        if cursor < len(ids):
-            length = len(ids) - cursor
-            self.text_indexes.extend(range(cursor, len(ids)))
-            self.segments.append(LanceSegment(length, "causal", "text", "understanding"))
-
-        if assistant_ce:
-            marker = list(self.tokenizer.encode(
-                "<|im_start|>assistant\n", add_special_tokens=False
-            ))
-            target_start = _find_subsequence(ids, marker, reverse=True) + len(marker)
-            labels = ids[target_start:]
-            if not labels:
-                raise ValueError("understanding template has no assistant target tokens")
-            self.ce_indexes.extend(range(target_start - 1, len(ids) - 1))
+        if target:
+            labels = text_ids + [self.tokens.im_end]
+            self.ce_indexes.extend(range(start, start + len(labels)))
             self.ce_labels.extend(labels)
             self.ce_weights.extend(
                 [ce_length_weight(len(labels), "square")] * len(labels)
             )
 
+    def add_visual(
+        self,
+        visual: LanceEncodedVisual,
+        encoder_kind: str,
+        *,
+        target: bool = False,
+        condition_frames=(),
+    ) -> None:
+        """Append one independently delimited ViT or VAE visual segment."""
+
+        if encoder_kind == "vit":
+            count = 0 if visual.vit_embedding is None else int(visual.vit_embedding.shape[0])
+        elif encoder_kind == "vae":
+            latent = visual.vae_latent
+            if latent is None:
+                count = 0
+            else:
+                patch_t, patch_h, patch_w = self.config.latent_patch_size
+                count = (
+                    int(latent.shape[0]) // patch_t
+                    * (int(latent.shape[1]) // patch_h)
+                    * (int(latent.shape[2]) // patch_w)
+                )
+        else:
+            raise ValueError("visual encoder kind must be vit or vae")
+        if count <= 0:
+            raise ValueError("encoded visual span must contain at least one token")
+
+        start = len(self.token_ids)
+        payload = start + 1
+        end = payload + count
+        self.token_ids.extend(
+            [self.tokens.vision_start]
+            + [self.tokens.video_pad] * count
+            + [self.tokens.vision_end]
+        )
+        self.text_indexes.extend((start, end))
+        if encoder_kind == "vit":
+            if target:
+                raise ValueError("ViT spans cannot be flow-matching targets")
+            self._add_vit_payload(visual, payload)
+            mode, modality, expert = "full", "vit", "understanding"
+        else:
+            self._add_vae_payload(
+                visual, payload, target=target, condition_frames=condition_frames
+            )
+            mode, modality, expert = (
+                "noise" if target else "full_noise"
+            ), "vae", "generation"
+        self.segments.append(
+            LanceSegment(count + 2, mode, modality, expert)
+        )
+        self.visual_spans.append((start, payload, end))
+        self.visual_specs.append(
+            (visual, encoder_kind, target, tuple(condition_frames))
+        )
+
     def build(self) -> LancePreparedSample:
         length = len(self.token_ids)
+        if not length:
+            raise ValueError("one Lance prepared sample must contain at least one segment")
+        self.position_ids = _qwen_mrope_positions(
+            length, self.visual_spans, self.visual_specs, self.config
+        )
         vae_indexes = torch.tensor(self.vae_indexes, dtype=torch.long) if self.vae_indexes else None
         vit_indexes = torch.tensor(self.vit_indexes, dtype=torch.long) if self.vit_indexes else None
         ce_indexes = torch.tensor(self.ce_indexes, dtype=torch.long) if self.ce_indexes else None
@@ -522,55 +428,42 @@ class _SampleAssembler:
 
 
 def build_generation_sample(
-    sample_id, caption, target, tokenizer, config, *, system_prompt=None,
+    sample_id, caption, target, tokenizer, config, *,
     condition_frames=(),
 ):
     assembler = _SampleAssembler(sample_id, tokenizer, config, LanceSpecialTokens.from_tokenizer(tokenizer))
-    system_prompt = system_prompt or lance_system_prompt(
-        "t2i" if target.modality == "image" else "t2v", target.modality
-    )
-    assembler.add_chat(
-        system_prompt,
-        "" if caption is None else str(caption),
-        _visual_placeholder(target.modality),
-        ((target, "vae", True, condition_frames),),
-        assistant_ce=False,
+    # BAGEL-style CFG dropout removes the complete caption segment.  It does
+    # not leave an empty im_start/im_end pair in the unconditional branch.
+    if caption is not None:
+        assembler.add_text(str(caption), target=False)
+    assembler.add_visual(
+        target, "vae", target=True, condition_frames=condition_frames
     )
     return assembler.build()
 
 
 def build_understanding_sample(
-    sample_id, prompt, answer, condition, tokenizer, config, *, system_prompt=None
+    sample_id, prompt, answer, condition, tokenizer, config
 ):
     assembler = _SampleAssembler(sample_id, tokenizer, config, LanceSpecialTokens.from_tokenizer(tokenizer))
-    assembler.add_chat(
-        system_prompt or lance_system_prompt("caption", condition.modality),
-        _visual_placeholder(condition.modality) + ("" if not prompt else str(prompt)),
-        str(answer),
-        ((condition, "vit", False),),
-        assistant_ce=True,
-    )
+    assembler.add_visual(condition, "vit", target=False)
+    if prompt is not None and str(prompt).strip():
+        assembler.add_text(str(prompt), target=False)
+    assembler.add_text(str(answer), target=True)
     return assembler.build()
 
 
 def build_edit_sample(
-    sample_id, instruction, condition, target, tokenizer, config, *, system_prompt=None
+    sample_id, instruction, condition, target, tokenizer, config
 ):
     if condition.modality != target.modality:
         raise ValueError("edit condition and target modalities must match")
     assembler = _SampleAssembler(sample_id, tokenizer, config, LanceSpecialTokens.from_tokenizer(tokenizer))
-    # Official text_template_user is rotated once before rendering, producing
-    # VIT condition, VAE condition, then the textual edit instruction.
-    visual = _visual_placeholder(condition.modality)
-    assembler.add_chat(
-        system_prompt or lance_system_prompt("edit", target.modality),
-        visual + visual + str(instruction),
-        _visual_placeholder(target.modality),
-        (
-            (condition, "vit", False),
-            (condition, "vae", False),
-            (target, "vae", True),
-        ),
-        assistant_ce=False,
-    )
+    # Keep the existing edit ordering, but delimit every modality segment
+    # independently: semantic and clean-latent conditions, instruction text,
+    # then the noisy VAE target.
+    assembler.add_visual(condition, "vit", target=False)
+    assembler.add_visual(condition, "vae", target=False)
+    assembler.add_text(str(instruction), target=False)
+    assembler.add_visual(target, "vae", target=True)
     return assembler.build()

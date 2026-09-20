@@ -1,0 +1,174 @@
+========================================================================================
+ Lance raw-PT 数据管线报告（Mobile-O-Pre-Train / Qwen3-0.6B / t2i+i2t 双任务）
+ 生成时间: 2026-09-17 07:54:31
+ 文档格式: <|im_start|> + conditioning + <视觉span> + completion + <|im_end|>
+           （无 chat template / 无 system prompt；CE=最后一个<|vision_end|>之后的补全段）
+========================================================================================
+
+[1] 数据源与管线配置
+  parquet 源        : /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-GEN（1 文件，2646 行，列=['image_bytes', 'caption']）
+  LLM/tokenizer     : /mnt/models/MODELS/Qwen3-0.6B（effective_vocab=151669）
+  冻结 ViT          : /mnt/models/MODELS/Qwen2.5-VL-3B-Instruct
+  冻结 VAE          : /mnt/models/MODELS/bytedance-research/Lance/Wan2.2_VAE.pth
+  几何              : variant=video latent_patch=[1, 2, 2] max_latent=64 max_frames=121 | LLM hidden=1024 head_dim=128 vit_out=2048
+  任务计数          : {'i2t': 331, 't2i': 331}（base_task_counts={'t2i': 331}）
+  caption dropout   : 0.1（t2i 条件丢弃，CFG 无条件分支，sample_id+seed 稳定哈希）
+  emit_tasks        : i2t,t2i（一行图像-文本对 → 同时产 t2i 与 i2t 样本）
+  text_format       : raw-pt
+  打包              : --task-weights t2i=1,i2t=1（精确整数比例循环洗牌），44K/50K token 预算
+
+[2] 编码阶段汇总（8 rank manifest）
+  rank | status    | 写入 | 失败
+  00000 | completed |  662 | 0
+  00001 | completed |  662 | 0
+  00002 | completed |  662 | 0
+  00003 | completed |  662 | 0
+  00004 | completed |  662 | 0
+  00005 | completed |  662 | 0
+  00006 | completed |  660 | 0
+  00007 | completed |  660 | 0
+  合计: 5292 样本（2646 t2i + 2646 i2t），失败 0
+
+[3] t2i 文档逐条解码（caption → VAE latent，MSE 监督）前 10 条 + dropout 命中示例
+  --- sample-00000000.pt 
+      条件文本(15 tok): <|im_start|>A close-up of a textured, cream-colored upholstered chair backrest.
+      视觉目标: 576 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 576 tok
+      段结构: (16,causal,text) | (578,noise,vae) | (1,causal,text)
+  --- sample-00000002.pt [DROP: caption 已丢弃 → CFG 无条件分支]
+      条件文本(0 tok): （空）
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (1,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000004.pt 
+      条件文本(15 tok): <|im_start|>Elegant black velvet blazer with diamond embellishments, stylish and sophisticated.
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (16,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000006.pt 
+      条件文本(11 tok): <|im_start|>Vintage wooden wall clock with pendulum and glass case.
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (12,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000008.pt 
+      条件文本(15 tok): <|im_start|>A koi fish swims gracefully in a snowy pond, reflecting tranquility.
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (16,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000010.pt 
+      条件文本(10 tok): <|im_start|>"Focused runner in motion against a textured wall."
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (11,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000012.pt 
+      条件文本(14 tok): <|im_start|>"Little girl and her huskies share a cozy moment indoors."
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (15,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000014.pt 
+      条件文本(8 tok): <|im_start|>"Dynamic guitarist performing under stage lights."
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (9,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000016.pt 
+      条件文本(12 tok): <|im_start|>"Golden fries with creamy dipping sauce on a rustic board."
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (13,causal,text) | (590,noise,vae) | (1,causal,text)
+  --- sample-00000018.pt 
+      条件文本(8 tok): <|im_start|>"Bright smile on a sunny day."
+      视觉目标: 588 latent token ≈ 等效分辨率 ~384×384 px（token=边/16）| MSE 监督 588 tok
+      段结构: (9,causal,text) | (590,noise,vae) | (1,causal,text)
+
+[4] i2t 文档逐条解码（ViT 特征 → caption，CE 监督）前 10 条
+  --- sample-00000001.pt
+      CE 标签(16 tok): A close-up of a textured, cream-colored upholstered chair backrest.<|im_end|>
+      视觉条件: 484 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=486（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(484, 2048)
+      段结构: (1,causal,text) | (486,full,vit) | (16,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000003.pt
+      CE 标签(15 tok): "Organized and stylish walk-in closet with vibrant clothing and accessories."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (15,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000005.pt
+      CE 标签(16 tok): Elegant black velvet blazer with diamond embellishments, stylish and sophisticated.<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (16,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000007.pt
+      CE 标签(12 tok): Vintage wooden wall clock with pendulum and glass case.<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (12,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000009.pt
+      CE 标签(16 tok): A koi fish swims gracefully in a snowy pond, reflecting tranquility.<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (16,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000011.pt
+      CE 标签(11 tok): "Focused runner in motion against a textured wall."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (11,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000013.pt
+      CE 标签(15 tok): "Little girl and her huskies share a cozy moment indoors."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (15,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000015.pt
+      CE 标签(9 tok): "Dynamic guitarist performing under stage lights."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (9,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000017.pt
+      CE 标签(13 tok): "Golden fries with creamy dipping sauce on a rustic board."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (13,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+  --- sample-00000019.pt
+      CE 标签(9 tok): "Bright smile on a sunny day."<|im_end|>
+      视觉条件: 475 ViT token ≈ 输入分辨率 ~616×616 px（token=边/28, 616 编码）
+      CE 定位: 起点=477（最后一个<|vision_end|>处预测首 token）| vit_embeddings 宽=(475, 2048)
+      段结构: (1,causal,text) | (477,full,vit) | (9,causal,text)
+      验证: CE 标签=caption+<|im_end|> → 通过
+
+[5] 全量 token 构成统计（扫描 2646 t2i + 2646 i2t 样本）
+  t2i: 平均文档 600 tok | caption 平均 12 tok | latent 平均 583 tok
+       caption dropout 命中 235/2646 = 8.88%（目标 10%）
+       latent 规模分布(前8): ~384x384×2646
+  i2t: 平均文档 490 tok | 答案(CE)平均 14 tok | ViT 平均 473 tok
+       ViT 规模分布(前8): ~616x616×2224, ~588x588×422
+  预编码样本总 token: 2884320（t2i 1586793 + i2t 1297527）
+
+[6] 打包结果（packed-raw）
+  status=completed | batch 数=66 | 总 token=2884320 | 跳过样本=0
+  --- batch-00000000.pt: 44320 tok | 文档=82(t2i 36 + i2t 46) | CE 695 tok | MSE 21036 tok | ViT 21859 tok | vit宽=2048
+  --- batch-00000033.pt: 44296 tok | 文档=81(t2i 43 + i2t 38) | CE 553 tok | MSE 25068 tok | ViT 17870 tok | vit宽=2048
+  --- batch-00000065.pt: 4819 tok | 文档=8(t2i 8 + i2t 0) | CE 0 tok | MSE 4668 tok | ViT 0 tok | vit宽=-
+  全部 66 batch 合计: 2884320 tok | t2i 文档 2646 | i2t 文档 2646 | CE 38253 tok | MSE 1543776 tok | ViT 1251336 tok
+  平均每 batch: 43702 tok | 每步(8 rank 全量) CE 4637 tok / MSE 187124 tok
+
+[7] 与旧 chat 格式对比（同一 2646 对数据）
+  旧 chat 格式/文档: <|im_start|>system\n{4选1提示词}<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n...
+                    模板开销 = system 提示词(~35-60 tok) + 3 组 role 标记(~15 tok) ≈ 50-75 tok/文档
+  新 raw 格式/文档 : <|im_start|> + 内容 + <|im_end|> = 2 tok 固定开销
+  旧数据           : Mobile-O-Pre-Train-packed（39 batch / 168 万 tok / 纯 t2i 单任务）
+  新数据           : Mobile-O-Pre-Train-packed-raw（66 batch / 2884320 tok / t2i+i2t 双任务 1:1）
+  注意: token 总量增加主要来自任务数翻倍（i2t 新增 ViT+caption），单文档开销反而大幅下降
+
+[8] 附录：产物路径与复现命令
+  编码日志  : /mnt/models/DATA_INIT/MULTI/T2I/encode_raw2_20260917.log
+  打包日志  : /mnt/models/DATA_INIT/MULTI/T2I/pack_raw2_20260917.log
+  样本目录  : /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-preencoded-raw/rank-XXXXX/{t2i,i2t}/sample-XXXXXXXX.pt
+  manifest  : /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-preencoded-raw/rank-XXXXX/manifest.json（8 份）+ /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-packed-raw/manifest.json
+  复现编码  : torchrun --nproc_per_node 8 --master_port 6011 scripts/prepare_lance_native_data.py \
+              --dataset-root /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-GEN --qwen-path /mnt/models/MODELS/Qwen3-0.6B \
+              --vit-path /mnt/models/MODELS/Qwen2.5-VL-3B-Instruct --vae-path .../Wan2.2_VAE.pth \
+              --output /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-preencoded-raw --variant video --latent-patch-size 1 2 2 \
+              --max-latent-size 64 --max-num-frames 121 --emit-tasks t2i,i2t
+  复现打包  : python3 scripts/pack_lance_native_data.py --input /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-preencoded-raw --output /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-packed-raw \
+              --variant video --llm-config /mnt/models/MODELS/Qwen3-0.6B/config.json --latent-patch-size 1 2 2 \
+              --max-latent-size 64 --max-num-frames 121 --task-weights t2i=1,i2t=1
+
+========================================================================================

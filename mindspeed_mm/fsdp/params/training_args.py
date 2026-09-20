@@ -132,6 +132,10 @@ class TrainingArguments:
         default=0.0,
         metadata={"help": "Ratio of learning rate warmup steps."},
     )
+    lr_warmup_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit warmup steps. When set, overrides lr_warmup_ratio."},
+    )
     lr_decay_style: str = field(
         default="constant",
         metadata={"help": "Name of the learning rate scheduler."},
@@ -175,6 +179,10 @@ class TrainingArguments:
     train_iters: int = field(
         default=10000,
         metadata={"help": "Total number of training iterations."},
+    )
+    train_tokens: int = field(
+        default=0,
+        metadata={"help": "Optional global-token training target; zero disables token-based stopping."},
     )
     train_epochs: Optional[int] = field(
         default=None,
@@ -220,6 +228,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Number of steps between checkpoint saves."},
     )
+    save_interval_tokens: int = field(
+        default=0,
+        metadata={"help": "Optional global-token checkpoint interval; zero disables token-based saves."},
+    )
     use_deter_comp: bool = field(
         default=False,
         metadata={"help": "Whether to use deterministic computation for reproducibility."},
@@ -244,6 +256,13 @@ class TrainingArguments:
 
         if self.lr < self.lr_min:
             raise ValueError(f"Learning rate {self.lr} < minimum lr {self.lr_min}. Check scheduler configuration.")
+
+        if self.lr_warmup_steps is not None and self.lr_warmup_steps < 0:
+            raise ValueError("lr_warmup_steps must be non-negative")
+        if self.train_tokens < 0:
+            raise ValueError("train_tokens must be non-negative")
+        if self.save_interval_tokens < 0:
+            raise ValueError("save_interval_tokens must be non-negative")
 
     def compute_distributed_training(
         self, parallel_args

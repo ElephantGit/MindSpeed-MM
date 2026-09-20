@@ -144,11 +144,20 @@ class LancePreparedSample:
 
         if (self.vit_indexes is None) != (self.vit_embeddings is None):
             raise LanceDataError("ViT indexes and embeddings must be provided together")
-        if self.vit_indexes is not None and self.vit_embeddings.shape != (
-            vit.numel(),
-            config.hidden_size,
-        ):
-            raise LanceDataError("vit_embeddings shape does not match ViT indexes")
+        if self.vit_indexes is not None:
+            if self.vit_embeddings.shape[0] != vit.numel():
+                raise LanceDataError("vit_embeddings shape does not match ViT indexes")
+            # The frozen ViT merger emits vit_out_hidden_size-wide features; a
+            # differing LLM hidden size is projected by the trainable connector
+            # at training time, so both widths are valid in prepared data.
+            if self.vit_embeddings.shape[1] not in (
+                config.hidden_size, config.vit_out_hidden_size,
+            ):
+                raise LanceDataError(
+                    "vit_embeddings width {} violates the ViT width contract".format(
+                        self.vit_embeddings.shape[1]
+                    )
+                )
 
         ce = _optional_indexes("CE", self.ce_indexes, self.length)
         mse = _optional_indexes("MSE", self.mse_indexes, self.length)

@@ -53,14 +53,16 @@ class LanceVisionConnector(torch.nn.Module):
 
     Released inference checkpoints do not need this module because their
     understanding path is already aligned.  Pretraining enables it explicitly
-    while keeping the expensive ViT backbone frozen.
+    while keeping the expensive ViT backbone frozen.  ``input_size`` is the
+    frozen ViT merger width (``vit_out_hidden_size``); ``output_size`` is the
+    LLM hidden size.  The two may differ for smaller Qwen bases.
     """
 
-    def __init__(self, hidden_size: int, *, device=None, dtype=None) -> None:
+    def __init__(self, input_size: int, output_size: int, *, device=None, dtype=None) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.fc1 = torch.nn.Linear(hidden_size, hidden_size, **factory_kwargs)
-        self.fc2 = torch.nn.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.fc1 = torch.nn.Linear(input_size, output_size, **factory_kwargs)
+        self.fc2 = torch.nn.Linear(output_size, output_size, **factory_kwargs)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(hidden_states), approximate="tanh"))
@@ -113,8 +115,20 @@ class LanceFSDPModel(LanceNativeModel, BaseModel, WeightInitMixin):
         )
         if not 0 < self.effective_vocab_size <= native_config.vocab_size:
             raise ValueError("effective_vocab_size must be in (0, vocab_size]")
+        if (
+            native_config.vit_out_hidden_size != native_config.hidden_size
+            and not use_vit_connector
+        ):
+            raise ValueError(
+                "vit_out_hidden_size ({}) != hidden_size ({}) requires "
+                "use_vit_connector=true so frozen ViT features can be projected "
+                "into the LLM space".format(
+                    native_config.vit_out_hidden_size, native_config.hidden_size
+                )
+            )
         self.connector = (
             LanceVisionConnector(
+                native_config.vit_out_hidden_size,
                 native_config.hidden_size,
                 device=device,
                 dtype=dtype,
@@ -261,8 +275,10 @@ class LanceFSDPModel(LanceNativeModel, BaseModel, WeightInitMixin):
             # synthetic tokens or changing the loss.
             connector_input = lance_batch.vit_embeddings
             if connector_input is None:
+                # Width must match the connector's input projection (the frozen
+                # ViT merger width), not the LLM hidden size.
                 connector_input = torch.empty(
-                    (0, self.config.hidden_size),
+                    (0, self.config.vit_out_hidden_size),
                     device=lance_batch.token_ids.device,
                     dtype=torch.float32,
                 )

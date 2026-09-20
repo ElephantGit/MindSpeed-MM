@@ -30,6 +30,7 @@ class _Tokenizer:
         "<|vision_start|>": 3,
         "<|vision_end|>": 4,
         "<|image_pad|>": 5,
+        "<|endoftext|>": 6,
         "<|video_pad|>": 26,
     }
 
@@ -86,17 +87,64 @@ def test_native_generation_and_understanding_samples_validate():
     )
     generation.validate(config)
     understanding.validate(config)
-    assert generation.token_ids[0].item() == tokenizer.mapping["<|im_start|>"]
+    # Raw PT uses independent modality segments.  T2I closes its caption text
+    # before opening the VAE target span.
+    caption_ids = tokenizer.encode("caption", add_special_tokens=False)
+    assert generation.token_ids.tolist() == (
+        [tokenizer.mapping["<|im_start|>"]]
+        + caption_ids
+        + [tokenizer.mapping["<|im_end|>"], tokenizer.mapping["<|vision_start|>"]]
+        + [tokenizer.mapping["<|video_pad|>"]] * 4
+        + [tokenizer.mapping["<|vision_end|>"]]
+    )
     assert generation.token_ids.tolist().count(tokenizer.mapping["<|video_pad|>"]) == 4
     assert tokenizer.mapping["<|image_pad|>"] not in generation.token_ids.tolist()
     assert generation.mse_indexes.numel() == 4
     assert generation.ce_indexes is None
     assert understanding.ce_indexes.numel() > 0
-    assert understanding.ce_labels[-1].item() == tokenizer.mapping["<|im_end|>"]
+    # I2T is ViT condition, optional prompt text, then an independently
+    # delimited answer.  Its im_start predicts the first answer token.
+    ids = understanding.token_ids.tolist()
+    vision_end = ids.index(tokenizer.mapping["<|vision_end|>"])
+    prompt_start = vision_end + 1
+    answer_start = prompt_start + len(tokenizer.encode("prompt", add_special_tokens=False)) + 2
+    assert ids[0] == tokenizer.mapping["<|vision_start|>"]
+    assert ids[prompt_start] == tokenizer.mapping["<|im_start|>"]
+    assert ids[answer_start] == tokenizer.mapping["<|im_start|>"]
+    assert understanding.ce_indexes[0].item() == answer_start
+    assert understanding.ce_labels.tolist() == tokenizer.encode(
+        "answer", add_special_tokens=False
+    ) + [tokenizer.mapping["<|im_end|>"]]
     assert understanding.mse_indexes is None
     # Lance shifts semantic ViT conditions into temporal MaPE band 1000.
     assert understanding.position_ids[0, understanding.vit_indexes[0]].item() >= 1000
     assert torch.unique(generation.position_ids[:, generation.vae_indexes], dim=1).shape[1] > 1
+
+
+def test_raw_segment_order_and_cfg_dropout_contract():
+    config = _config()
+    tokenizer = _Tokenizer()
+    vision_start = tokenizer.mapping["<|vision_start|>"]
+    vision_end = tokenizer.mapping["<|vision_end|>"]
+    im_start = tokenizer.mapping["<|im_start|>"]
+    im_end = tokenizer.mapping["<|im_end|>"]
+
+    unconditional = build_generation_sample(
+        "t2i-null", None, _visual(vit=False), tokenizer, config
+    )
+    assert unconditional.token_ids[0].item() == vision_start
+    assert unconditional.token_ids[-1].item() == vision_end
+    assert im_start not in unconditional.token_ids.tolist()
+    assert im_end not in unconditional.token_ids.tolist()
+
+    caption = build_understanding_sample(
+        "i2t-caption", "", "answer", _visual(vae=False), tokenizer, config
+    )
+    ids = caption.token_ids.tolist()
+    assert ids[0] == vision_start
+    assert ids[ids.index(vision_end) + 1] == im_start
+    assert ids[-1] == im_end
+    assert caption.ce_indexes[0].item() == ids.index(im_start)
 
 
 def test_native_edit_routes_all_vae_tokens_to_generation_expert():

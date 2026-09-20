@@ -162,8 +162,6 @@ def test_qwen_file_initialization_materializes_omitted_tied_lm_head(tmp_path):
         if (
             source_name == "lm_head.weight"
             or "_moe_gen" in source_name
-            or ".q_norm." in source_name
-            or ".k_norm." in source_name
         ):
             continue
         source[source_name] = torch.full_like(parameter, 0.375)

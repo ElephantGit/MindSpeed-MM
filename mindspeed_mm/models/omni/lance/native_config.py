@@ -8,7 +8,7 @@ CI validation run on machines that do not have an Ascend software stack.
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 
 class LanceConfigError(ValueError):
@@ -32,6 +32,10 @@ class LanceNativeConfig:
     mrope_section: Tuple[int, int, int] = (16, 24, 24)
     qkv_bias: bool = True
     tie_word_embeddings: bool = False
+    # Qwen3 small models decouple head_dim from hidden_size/num_attention_heads
+    # (e.g. hidden=1024, 16 heads, head_dim=128).  None keeps the derived
+    # hidden_size // num_attention_heads value used by Qwen2.5-VL releases.
+    explicit_head_dim: Optional[int] = None
 
     latent_channels: int = 48
     latent_patch_size: Tuple[int, int, int] = (1, 1, 1)
@@ -71,11 +75,15 @@ class LanceNativeConfig:
             "vit_intermediate_size": self.vit_intermediate_size,
             "vit_num_heads": self.vit_num_heads,
             "vit_window_size": self.vit_window_size,
+            "vit_out_hidden_size": self.vit_out_hidden_size,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise LanceConfigError("configuration values must be positive: {}".format(", ".join(invalid)))
-        if self.hidden_size % self.num_attention_heads:
+        if self.explicit_head_dim is not None:
+            if self.explicit_head_dim <= 0 or self.explicit_head_dim % 2:
+                raise LanceConfigError("explicit head_dim must be a positive even integer")
+        elif self.hidden_size % self.num_attention_heads:
             raise LanceConfigError("hidden_size must be divisible by num_attention_heads")
         if self.num_attention_heads % self.num_key_value_heads:
             raise LanceConfigError("num_attention_heads must be divisible by num_key_value_heads")
@@ -83,8 +91,9 @@ class LanceNativeConfig:
             raise LanceConfigError("mrope_section must sum to half of the attention head dimension")
         if len(self.latent_patch_size) != 3 or any(item <= 0 for item in self.latent_patch_size):
             raise LanceConfigError("latent_patch_size must contain three positive integers")
-        if self.vit_out_hidden_size != self.hidden_size:
-            raise LanceConfigError("released Lance checkpoints require ViT output size == LLM hidden size")
+        # vit_out_hidden_size may differ from hidden_size; the trainable
+        # LanceVisionConnector projects frozen ViT features into the LLM space
+        # whenever the two widths disagree (see LanceFSDPModel).
         if self.vit_hidden_size % self.vit_num_heads:
             raise LanceConfigError("vit_hidden_size must be divisible by vit_num_heads")
         if self.vit_window_size % (self.vit_spatial_merge_size * self.vit_patch_size):
@@ -96,6 +105,8 @@ class LanceNativeConfig:
 
     @property
     def head_dim(self) -> int:
+        if self.explicit_head_dim is not None:
+            return self.explicit_head_dim
         return self.hidden_size // self.num_attention_heads
 
     @property
@@ -205,6 +216,7 @@ class LanceNativeConfig:
             "max_position_embeddings": "max_position_embeddings",
             "rope_theta": "rope_theta",
             "tie_word_embeddings": "tie_word_embeddings",
+            "head_dim": "explicit_head_dim",
         }
         updates = {target: raw[key] for key, target in aliases.items() if key in raw}
         rope_scaling = raw.get("rope_scaling")

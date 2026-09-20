@@ -1,0 +1,140 @@
+# Mobile-O t2i preencoded pretraining (from-scratch run from lance-qwen-init-dcp).
+#
+# Data: /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-packed
+#   39 pre-packed batches, 1,687,341 multimodal tokens (Amshaker/Mobile-O-Pre-Train
+#   shard 00000: 2646 t2i pairs -> Wan2.2 VAE latents, packed 44K-50K budget).
+#   Generated 2026-09-16 by scripts/prepare_lance_native_data.py + pack_lance_native_data.py
+#   with --variant video --latent-patch-size 1 2 2 --max-latent-size 64 --max-num-frames 121,
+#   i.e. the same geometry contract as the reference Lance native PT.
+#
+# Differences vs fsdp2_pt_preencoded.yaml: data files is pinned to the Mobile-O
+# packed directory instead of ${LANCE_PREENCODED_DATA}. Everything else follows
+# the official PT configuration so the two runs stay comparable.
+#
+# Launch with: bash scripts/pretrain_lance_mobile_o.sh
+
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: auto
+  fsdp_plan:
+    # LanceFSDPModel installs these units in its actual execution order and
+    # wires prefetch across connector -> bridges -> decoder -> output heads.
+    apply_modules:
+      - connector
+      - language_model.model.layers.{*}
+      - language_model.model.embed_tokens
+      - language_model.model
+      - language_model.lm_head
+      - vae2llm
+      - llm2vae
+      - time_embedder
+    param_dtype: bf16
+    reduce_dtype: fp32
+    cast_forward_inputs: true
+    reshard_after_forward: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    pregather: false
+  # Lance owns checkpointing inside its decoder so non-tensor packed-attention
+  # metadata remains outside the generic Transformers recompute wrapper.
+  recompute: false
+  ulysses_parallel_size: 1
+
+data:
+  dataset_param:
+    dataset_type: native_lance
+    format: preencoded
+    files:
+      - /mnt/models/DATA_INIT/MULTI/T2I/Mobile-O-Pre-Train-packed
+    resample_timesteps: true
+    dataset_dir: /
+    basic_parameters:
+      dataset: native-lance-preencoded
+    preprocess_parameters: {}
+  dataloader_param:
+    dataloader_mode: sampler
+    sampler_type: BaseRandomBatchSampler
+    shuffle: true
+    drop_last: true
+    pin_memory: true
+    num_workers: ${LANCE_NUM_WORKERS}
+    prefetch_factor: 2
+    persistent_workers: true
+    collate_param:
+      model_name: lance
+
+model:
+  model_id: lance
+  native_config_only: true
+  variant: video
+  # This is the same configuration consumed by the native DCP initializer.
+  # It prevents silent fallback to a different vocabulary or layer shape.
+  llm_config: ${LANCE_LLM_CONFIG}
+  native_config:
+    latent_patch_size:
+      - ${LANCE_LATENT_PATCH_T}
+      - ${LANCE_LATENT_PATCH_H}
+      - ${LANCE_LATENT_PATCH_W}
+    max_latent_size: ${LANCE_MAX_LATENT_SIZE}
+    max_num_frames: ${LANCE_MAX_NUM_FRAMES}
+  effective_vocab_size: ${LANCE_EFFECTIVE_VOCAB_SIZE}
+  gradient_checkpointing: true
+  ce_weight: 0.25
+  mse_weight: 1.0
+  timestep_shift: 1.0
+  use_vit_connector: true
+  # Frozen media encoders run once in prepare_lance_native_data.py and do not
+  # consume training-device memory or FSDP/checkpoint bandwidth.
+  include_vit_model: false
+  freeze: []
+  use_ema: true
+  ema_decay: 0.9999
+  loss_cfg:
+    loss_type: raw
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  seed: 2025
+  lr: 1.0e-4
+  lr_start: 0.0
+  lr_min: 1.0e-7
+  lr_decay_style: constant
+  # Official 2500/350K warmup ratio; pass LANCE_WARMUP_RATIO to override for
+  # shorter runs (e.g. 0.025 for a 1000-step run keeps ~25 warmup steps).
+  lr_warmup_ratio: ${LANCE_WARMUP_RATIO}
+  weight_decay: 0.0
+  train_iters: ${LANCE_TRAIN_ITERS}
+  # Allows a controlled interruption while the scheduler still targets the
+  # full train_iters horizon; used by 10+resume+10 continuity validation.
+  stop_after_iters: ${LANCE_STOP_AFTER_ITERS}
+  clip_grad: 1.0
+  optimizer: adamw
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-15
+  adam_fused: true
+  init_model_with_meta_device: true
+  # Fresh PT run starts from the lance-qwen-init-dcp artifacts; point
+  # LANCE_LOAD_DCP at an existing iter_XXXXXX to resume instead.
+  load: ${LANCE_LOAD_DCP}
+  load_strict: true
+  no_load_optim: false
+  no_load_rng: false
+  log_interval: 1   # debug: 每步打印 loss/metrics（原为 10）
+  # Empty by default. Set LANCE_TRACE_FILE only for short continuity tests;
+  # each rank writes an independent .rankNNNNN.jsonl file.
+  trace_file: ${LANCE_TRACE_FILE}
+  save_interval: ${LANCE_SAVE_INTERVAL}
+  save: ${LANCE_OUTPUT_DIR}
+  save_async: false
+  use_deter_comp: false
+  plugin:
+    - mindspeed_mm/fsdp/models/lance
+    - mindspeed_mm/fsdp/data/datasets/lance
+
+tools:
+  profile:
+    enable: false
+  memory_profile:
+    enable: false

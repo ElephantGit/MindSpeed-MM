@@ -215,17 +215,27 @@ class LanceMoTAttention(nn.Module):
         self.attention_backend = attention_backend
         factory = {"device": device, "dtype": dtype}
 
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True, **factory)
+        # Qwen3 small bases decouple head_dim from hidden_size, so the query
+        # width must follow num_heads * head_dim (== hidden_size on Qwen2.5-VL).
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=True, **factory
+        )
         self.k_proj = nn.Linear(self.hidden_size, config.kv_dim, bias=True, **factory)
         self.v_proj = nn.Linear(self.hidden_size, config.kv_dim, bias=True, **factory)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False, **factory)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False, **factory
+        )
         self.q_norm = LanceRMSNorm(self.head_dim, config.rms_norm_eps, **factory)
         self.k_norm = LanceRMSNorm(self.head_dim, config.rms_norm_eps, **factory)
 
-        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.hidden_size, bias=True, **factory)
+        self.q_proj_moe_gen = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=True, **factory
+        )
         self.k_proj_moe_gen = nn.Linear(self.hidden_size, config.kv_dim, bias=True, **factory)
         self.v_proj_moe_gen = nn.Linear(self.hidden_size, config.kv_dim, bias=True, **factory)
-        self.o_proj_moe_gen = nn.Linear(self.hidden_size, self.hidden_size, bias=False, **factory)
+        self.o_proj_moe_gen = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False, **factory
+        )
         self.q_norm_moe_gen = LanceRMSNorm(self.head_dim, config.rms_norm_eps, **factory)
         self.k_norm_moe_gen = LanceRMSNorm(self.head_dim, config.rms_norm_eps, **factory)
 
@@ -278,7 +288,7 @@ class LanceMoTAttention(nn.Module):
             generation_indexes,
             self.q_proj,
             self.q_proj_moe_gen,
-            self.hidden_size,
+            self.num_heads * self.head_dim,
         ).view(-1, self.num_heads, self.head_dim)
         key = self._route_projection(
             hidden_states,
@@ -320,7 +330,7 @@ class LanceMoTAttention(nn.Module):
         understanding_indexes: torch.Tensor,
         generation_indexes: torch.Tensor,
     ) -> torch.Tensor:
-        attended = attended.reshape(-1, self.hidden_size)
+        attended = attended.reshape(-1, self.num_heads * self.head_dim)
         return self._route_projection(
             attended,
             understanding_indexes,

@@ -3,8 +3,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-6000}"
+LANCE_WORLD_SIZE=$((NPROC_PER_NODE * NNODES))
 CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/examples/lance/config/fsdp2_pt_preencoded.yaml}"
 LANCE_MODEL_ROOT="${LANCE_MODEL_ROOT:-/mnt/qs/models/bytedance-research/Lance}"
 QWEN_PATH="${QWEN_PATH:-/mnt/qs/models/Qwen/Qwen2.5-VL-3B-Instruct}"
@@ -20,8 +23,30 @@ export LANCE_PREENCODED_DATA="${LANCE_PREENCODED_DATA:-${REPO_ROOT}/datasets/lan
 export LANCE_OUTPUT_DIR="${LANCE_OUTPUT_DIR:-${REPO_ROOT}/outputs/lance-native-pt}"
 export LANCE_SYNTHETIC_OUTPUT="${LANCE_SYNTHETIC_OUTPUT:-${REPO_ROOT}/outputs/lance-native-synthetic}"
 export LANCE_LLM_CONFIG="${LANCE_LLM_CONFIG:-${QWEN_PATH}/config.json}"
-export LANCE_TRAIN_ITERS="${LANCE_TRAIN_ITERS:-350000}"
-export LANCE_WARMUP_RATIO="${LANCE_WARMUP_RATIO:-0.007142857142857143}"
+export LANCE_TRAIN_TOKENS="${LANCE_TRAIN_TOKENS:-0}"
+export LANCE_SAVE_INTERVAL_TOKENS="${LANCE_SAVE_INTERVAL_TOKENS:-0}"
+export LANCE_WARMUP_STEPS="${LANCE_WARMUP_STEPS:-2500}"
+export LANCE_GRADIENT_ACCUMULATION_STEPS="${LANCE_GRADIENT_ACCUMULATION_STEPS:-1}"
+export LANCE_ESTIMATED_TOKENS_PER_RANK="${LANCE_ESTIMATED_TOKENS_PER_RANK:-44000}"
+if [[ -z "${LANCE_TRAIN_ITERS:-}" ]]; then
+    if (( LANCE_TRAIN_TOKENS > 0 )); then
+        LANCE_ESTIMATED_TOKENS_PER_STEP=$((
+            LANCE_ESTIMATED_TOKENS_PER_RANK * LANCE_WORLD_SIZE * LANCE_GRADIENT_ACCUMULATION_STEPS
+        ))
+        LANCE_ESTIMATED_TARGET_ITERS=$((
+            (LANCE_TRAIN_TOKENS + LANCE_ESTIMATED_TOKENS_PER_STEP - 1) / LANCE_ESTIMATED_TOKENS_PER_STEP
+        ))
+        # Leave 5% headroom because packed sequence lengths are variable.  The
+        # exact token counter stops at the requested budget before this cap.
+        LANCE_TRAIN_ITERS=$((
+            (LANCE_ESTIMATED_TARGET_ITERS * 105 + 99) / 100
+        ))
+    else
+        LANCE_TRAIN_ITERS=350000
+        LANCE_ESTIMATED_TARGET_ITERS=$LANCE_TRAIN_ITERS
+    fi
+fi
+export LANCE_TRAIN_ITERS
 export LANCE_SAVE_INTERVAL="${LANCE_SAVE_INTERVAL:-2000}"
 # One pre-packed item can hold 50K multimodal tokens and tens of MiB of latent
 # tensors.  Multiprocess prefetch multiplies that footprint across eight ranks
@@ -69,7 +94,7 @@ else
         --max-latent-size "${LANCE_MAX_LATENT_SIZE}" \
         --max-num-frames "${LANCE_MAX_NUM_FRAMES}" \
         --effective-vocab-size "${LANCE_EFFECTIVE_VOCAB_SIZE}" \
-        --world-size "${NPROC_PER_NODE}"
+        --world-size "${LANCE_WORLD_SIZE}"
 fi
 
 export NON_MEGATRON=true
@@ -85,12 +110,22 @@ echo "Load DCP: ${LANCE_LOAD_DCP}"
 echo "Pre-encoded data: ${LANCE_PREENCODED_DATA}"
 echo "Output: ${LANCE_OUTPUT_DIR}"
 echo "Training iterations: ${LANCE_TRAIN_ITERS}"
+echo "Distributed launch: nnodes=${NNODES}, node_rank=${NODE_RANK}, nproc_per_node=${NPROC_PER_NODE}, world_size=${LANCE_WORLD_SIZE}"
+echo "Token target: ${LANCE_TRAIN_TOKENS}; token checkpoint interval: ${LANCE_SAVE_INTERVAL_TOKENS}; warmup steps: ${LANCE_WARMUP_STEPS}"
+if [[ -n "${LANCE_ESTIMATED_PAIR_EXPOSURES:-}" ]]; then
+    echo "Estimated data reuse: ${LANCE_ESTIMATED_PAIR_EXPOSURES} image-text pair exposures across ${LANCE_ESTIMATED_DATA_EPOCHS:-unknown} epochs (not unique pairs)"
+fi
+if [[ -n "${LANCE_ESTIMATED_TARGET_ITERS:-}" ]]; then
+    echo "Estimated optimizer steps to token target: ${LANCE_ESTIMATED_TARGET_ITERS} (train_iters includes 5% safety headroom)"
+fi
 echo "Latent geometry: ${LANCE_LATENT_PATCH_T} ${LANCE_LATENT_PATCH_H} ${LANCE_LATENT_PATCH_W}; max frames: ${LANCE_MAX_NUM_FRAMES}"
 if [[ -n "${LANCE_TRACE_FILE}" ]]; then
     echo "Continuity trace: ${LANCE_TRACE_FILE}"
 fi
 
 torchrun \
+    --nnodes "${NNODES}" \
+    --node_rank "${NODE_RANK}" \
     --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \

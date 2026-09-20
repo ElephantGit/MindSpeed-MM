@@ -21,6 +21,7 @@ from mindspeed_mm.fsdp.utils.device import get_device_type
 from mindspeed_mm.fsdp.utils.dtype import get_dtype
 from mindspeed_mm.fsdp.utils.utils import get_time
 from mindspeed_mm.models.omni.lance.training_lance import LanceTrainingBatch
+from mindspeed_mm.models.omni.lance.debug_hooks import hook_step, remember_batch
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,12 @@ def _restore_accelerator_rng_state(state):
     setter = getattr(module, "set_rng_state", None)
     if callable(setter):
         setter(state)
+
+
+def _crossed_interval(previous: int, current: int, interval: int) -> bool:
+    """Return whether a monotonically increasing counter crossed a boundary."""
+
+    return interval > 0 and current // interval > previous // interval
 
 
 def _move(value: Any, dtype=None):
@@ -162,6 +169,7 @@ class LanceTrainEngine(TrainEngine):
             decay=float(getattr(config.model, "ema_decay", 0.9999)),
         ) if bool(getattr(config.model, "use_ema", True)) else None
         self._loaded_release = False
+        self.consumed_train_tokens = 0
         self.last_metrics = {}
         raw_trace = getattr(config.training, "trace_file", None)
         self.trace_file = Path(raw_trace).expanduser().resolve() if raw_trace else None
@@ -185,13 +193,18 @@ class LanceTrainEngine(TrainEngine):
         # Keep metric accumulation on the accelerator.  Converting every
         # micro-step scalar to Python would serialize the NPU stream; FP64 is
         # also unnecessary for at most world_size * 50K token counts.
-        metric_sums = torch.zeros(
-            4, device=get_device_type(), dtype=torch.float32
-        )
+        metric_sums = torch.zeros(5, device=get_device_type(), dtype=torch.float32)
         for accum_index in range(accum_steps):
             raw_batch = self.get_batch(train_dataloader_iter)
+            # LANCE_DEBUG=1 instrumentation: keeps the CPU-side batch for the
+            # per-step activation budget. No-op (and no reference kept) otherwise.
+            remember_batch(self, raw_batch)
             if isinstance(raw_batch, dict) and "batch_path" in raw_batch:
                 self._step_batch_paths.append(str(raw_batch["batch_path"]))
+            lance_batch = raw_batch.get("lance_batch") if isinstance(raw_batch, dict) else None
+            if lance_batch is None:
+                raise TypeError("native Lance batch is missing lance_batch")
+            metric_sums[4] += lance_batch.sequence_length
             batch = _move(raw_batch, dtype)
             sync = self.model.no_sync if (
                 hasattr(self.model, "no_sync") and accum_index < accum_steps - 1
@@ -214,7 +227,7 @@ class LanceTrainEngine(TrainEngine):
         dist.all_reduce(metric_sums, group=dp_group)
         metric_sums[:2] /= dist.get_world_size(group=dp_group)
         self.last_metrics = dict(zip(
-            ("ce", "mse", "ce_tokens", "mse_tokens"),
+            ("ce", "mse", "ce_tokens", "mse_tokens", "tokens"),
             metric_sums.cpu().tolist(),
         ))
         return averaged
@@ -250,6 +263,7 @@ class LanceTrainEngine(TrainEngine):
             "rank": rank,
             "iteration": self.iteration,
             "consumed_train_samples": self.consumed_train_samples,
+            "consumed_train_tokens": self.consumed_train_tokens,
             "batch_paths": self._step_batch_paths,
             "loss": float(loss.detach().item()),
             "grad_norm": None if grad_norm is None else float(grad_norm),
@@ -272,9 +286,10 @@ class LanceTrainEngine(TrainEngine):
         if self.last_metrics:
             print_rank(
                 logger.info,
-                " Lance metrics | ce: {:.6E} | mse: {:.6E} | ce tokens: {:.0f} | mse tokens: {:.0f} |".format(
+                " Lance metrics | ce: {:.6E} | mse: {:.6E} | ce tokens: {:.0f} | mse tokens: {:.0f} | step tokens: {:.0f} | consumed tokens: {} |".format(
                     self.last_metrics["ce"], self.last_metrics["mse"],
                     self.last_metrics["ce_tokens"], self.last_metrics["mse_tokens"],
+                    self.last_metrics["tokens"], self.consumed_train_tokens,
                 ),
             )
 
@@ -293,10 +308,19 @@ class LanceTrainEngine(TrainEngine):
         self._loaded_release = bool(release)
         if release:
             iteration, consumed = 0, 0
+            self.consumed_train_tokens = 0
         else:
             extra = state["extra_state"]
             iteration = int(extra["iteration"])
             consumed = int(extra["consumed_train_samples"])
+            if "consumed_train_tokens" not in extra and int(
+                getattr(self.args.training, "train_tokens", 0)
+            ) > 0:
+                raise RuntimeError(
+                    "token-budget training cannot resume an old checkpoint that lacks "
+                    "consumed_train_tokens"
+                )
+            self.consumed_train_tokens = int(extra.get("consumed_train_tokens", 0))
             self.lr_scheduler.load_state_dict(extra["lr_scheduler"])
             self.train_dataloader.load_state_dict(extra["train_dataloader"])
             if not self.args.training.no_load_rng and "torch_rng_state" in extra:
@@ -309,6 +333,7 @@ class LanceTrainEngine(TrainEngine):
         extra_state = {
             "iteration": iteration,
             "consumed_train_samples": consumed_train_samples,
+            "consumed_train_tokens": self.consumed_train_tokens,
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "train_dataloader": self.train_dataloader.state_dict(),
         }
@@ -329,6 +354,22 @@ class LanceTrainEngine(TrainEngine):
             save_async=self.args.training.save_async,
         )
         dist.barrier()
+        # Publish a small completion marker only after every rank has finished
+        # the DCP save.  External evaluators can safely watch this file without
+        # racing partially written checkpoint shards.
+        if dist.get_rank() == 0:
+            checkpoint = Path(self.args.training.save) / "iter_{:07d}".format(iteration)
+            marker = checkpoint / "lance_checkpoint.json"
+            temporary = marker.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps({
+                "iteration": int(iteration),
+                "consumed_train_samples": int(consumed_train_samples),
+                "consumed_train_tokens": int(self.consumed_train_tokens),
+                "ema": self.ema_state is not None,
+                "status": "completed",
+            }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(marker)
+        dist.barrier()
 
     def train(self):
         # Parent loop already supplies FSDP pregather, fused optimizer, profiler,
@@ -344,8 +385,14 @@ class LanceTrainEngine(TrainEngine):
         ))
         if not 0 < stop_after <= self.args.training.train_iters:
             raise ValueError("training.stop_after_iters must be in (0, train_iters]")
+        train_tokens = int(getattr(self.args.training, "train_tokens", 0))
+        save_interval_tokens = int(getattr(
+            self.args.training, "save_interval_tokens", 0
+        ))
         saved_iteration = None
-        while self.iteration < stop_after:
+        while self.iteration < stop_after and (
+            train_tokens <= 0 or self.consumed_train_tokens < train_tokens
+        ):
             memory_profiler.step()
             start = get_time(barrier=True)
             if self.args.parallel.fsdp_plan.pregather:
@@ -363,20 +410,33 @@ class LanceTrainEngine(TrainEngine):
             self.optimizer.zero_grad(set_to_none=True)
             self.profiler.step()
             self.consumed_train_samples += self.args.training.global_batch_size
+            previous_tokens = self.consumed_train_tokens
+            self.consumed_train_tokens += int(round(self.last_metrics["tokens"]))
             self.iteration += 1
             self._write_trace(loss[0], grad_norm, current_lr)
             elapsed = get_time(barrier=True) - start
+            # LANCE_DEBUG=1 instrumentation: per-step time, loss, device memory,
+            # and analytic activation budget. No-op otherwise.
+            hook_step(self, self.iteration, elapsed, loss[0], grad_norm)
             if self.iteration % self.args.training.log_interval == 0:
                 self.training_log(
                     self.iteration, elapsed, current_lr,
                     self.consumed_train_samples, loss, grad_norm,
                 )
             current_lr = self.lr_scheduler.get_last_lr()[0]
-            if (
+            step_checkpoint_due = (
                 self.args.training.save
                 and self.args.training.save_interval > 0
                 and self.iteration % self.args.training.save_interval == 0
-            ):
+            )
+            token_checkpoint_due = (
+                self.args.training.save
+                and _crossed_interval(
+                    previous_tokens, self.consumed_train_tokens,
+                    save_interval_tokens,
+                )
+            )
+            if step_checkpoint_due or token_checkpoint_due:
                 self.save(self.iteration, self.consumed_train_samples)
                 saved_iteration = self.iteration
         self.profiler.stop()
