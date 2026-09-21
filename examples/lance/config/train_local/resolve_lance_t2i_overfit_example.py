@@ -18,11 +18,15 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--sample-index",
         type=int,
-        default=0,
         help="zero-based T2I sample index in the deterministic preprocessing scan",
+    )
+    selection.add_argument(
+        "--sample-id",
+        help="exact sample_id stored in LancePackedSequence document metadata",
     )
     parser.add_argument("--resolution", type=int, default=768)
     parser.add_argument("--vae-downsample", type=int, default=16)
@@ -93,8 +97,9 @@ def center_crop_for_training(image, target_width, target_height):
     return resized.crop((left, top, left + target_width, top + target_height))
 
 
-def resolve_example(root, sample_index):
-    if sample_index < 0:
+def resolve_example(root, sample_index, requested_sample_id):
+    sample_index = 0 if sample_index is None and requested_sample_id is None else sample_index
+    if sample_index is not None and sample_index < 0:
         raise ValueError("sample-index must be non-negative")
     selected = 0
     for path in sorted(root.rglob("*.parquet")):
@@ -104,12 +109,17 @@ def resolve_example(root, sample_index):
             for row_index, row in enumerate(rows):
                 if source_task(path, row) != "t2i":
                     continue
-                if selected == sample_index:
-                    sample_id = "{}:{}:{}".format(
-                        path.relative_to(root), row_group, row_index
-                    )
-                    return path, row_group, row_index, sample_id, row
+                sample_id = "{}:{}:{}".format(
+                    path.relative_to(root), row_group, row_index
+                )
+                if (
+                    (requested_sample_id is not None and sample_id == requested_sample_id)
+                    or (requested_sample_id is None and selected == sample_index)
+                ):
+                    return path, row_group, row_index, selected, sample_id, row
                 selected += 1
+    if requested_sample_id is not None:
+        raise ValueError("T2I sample_id not found: {}".format(requested_sample_id))
     raise ValueError(
         "dataset contains only {} T2I samples; requested index {}".format(
             selected, sample_index
@@ -134,8 +144,8 @@ def main():
     if existing:
         raise FileExistsError("refusing to overwrite existing outputs: {}".format(existing))
 
-    path, row_group, row_index, sample_id, row = resolve_example(
-        root, args.sample_index
+    path, row_group, row_index, sample_index, sample_id, row = resolve_example(
+        root, args.sample_index, args.sample_id
     )
     image = normalized_rgb(row["image_bytes"])
     stride_h = args.vae_downsample * args.latent_patch_height
@@ -151,7 +161,7 @@ def main():
     prompt = str(row["caption"])
     metadata = {
         "schema_version": 1,
-        "sample_index": args.sample_index,
+        "sample_index": sample_index,
         "sample_id": sample_id,
         "parquet": str(path),
         "row_group": row_group,
