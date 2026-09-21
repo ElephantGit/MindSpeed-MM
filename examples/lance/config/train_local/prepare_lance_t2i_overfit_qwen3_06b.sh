@@ -64,6 +64,7 @@ ASCEND_RT_VISIBLE_DEVICES="${PREPARE_DEVICE}" torchrun \
     --max-samples "${max_samples}" \
     --seed 2025 \
     --text-cond-dropout-prob 0.0 \
+    --base-tasks t2i \
     --emit-tasks t2i \
     --fail-fast
 

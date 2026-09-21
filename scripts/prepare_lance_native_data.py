@@ -68,6 +68,12 @@ def parse_arguments():
              "(t2i/t2v rows can additionally emit their i2t/v2t twin). "
              "Default: only the schema-detected task",
     )
+    parser.add_argument(
+        "--base-tasks",
+        help="Optional comma list of schema-detected source tasks to include before "
+             "applying --max-samples, e.g. t2i.  This filters a mixed six-task root "
+             "without changing --emit-tasks semantics.",
+    )
     parser.add_argument("--sample-posterior", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--resample-posterior-during-training",
@@ -385,6 +391,15 @@ def main():
             raise ValueError("unsupported --emit-tasks entries: {}".format(sorted(unknown)))
     else:
         emit_tasks = None
+    if args.base_tasks:
+        base_tasks = {item.strip() for item in args.base_tasks.split(",") if item.strip()}
+        unknown = base_tasks - {"t2i", "t2v", "i2t", "v2t", "i2i", "v2v"}
+        if unknown:
+            raise ValueError("unsupported --base-tasks entries: {}".format(sorted(unknown)))
+        if not base_tasks:
+            raise ValueError("--base-tasks must contain at least one task")
+    else:
+        base_tasks = None
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     device = _device()
@@ -440,6 +455,8 @@ def main():
                 sample_id = "{}:{}:{}".format(path.relative_to(root), row_group, row_index)
                 try:
                     base_task = _task(path, row)
+                    if base_tasks is not None and base_task not in base_tasks:
+                        continue
                     if (
                         args.max_samples_per_task is not None
                         and base_task_counts.get(base_task, 0) >= args.max_samples_per_task
@@ -483,6 +500,7 @@ def main():
         "text_cond_dropout_prob": args.text_cond_dropout_prob,
         "text_format": "raw-pt",
         "emit_tasks": sorted(emit_tasks) if emit_tasks else None,
+        "base_tasks": sorted(base_tasks) if base_tasks else None,
         "resample_posterior_during_training": args.resample_posterior_during_training,
         "dataset_root": str(root),
         "parquet_files": len(files),
