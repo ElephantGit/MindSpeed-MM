@@ -1,0 +1,127 @@
+# Qwen3-0.6B Lance T2I overfit diagnostic shared by stages A/B/C.
+# Stage launchers provide all LANCE_OVERFIT_* values below.
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: auto
+  fsdp_plan:
+    apply_modules:
+      - connector
+      - language_model.model.layers.{*}
+      - language_model.model.embed_tokens
+      - language_model.model
+      - language_model.lm_head
+      - vae2llm
+      - llm2vae
+      - time_embedder
+    param_dtype: bf16
+    reduce_dtype: fp32
+    cast_forward_inputs: true
+    reshard_after_forward: ${LANCE_RESHARD_AFTER_FORWARD}
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    pregather: false
+  recompute: false
+  ulysses_parallel_size: 1
+
+data:
+  dataset_param:
+    dataset_type: native_lance
+    format: preencoded
+    files:
+      - ${LANCE_PREENCODED_DATA}
+    resample_timesteps: ${LANCE_OVERFIT_RESAMPLE_TIMESTEPS}
+    # An integer makes noise a deterministic function of packed-batch index;
+    # YAML null preserves normal per-visit random noise.
+    fixed_noise_seed: ${LANCE_OVERFIT_FIXED_NOISE_SEED}
+    # Stage A uses the stored VAE posterior mean without sampling its variance.
+    disable_posterior_sampling: ${LANCE_OVERFIT_DISABLE_POSTERIOR_SAMPLING}
+    dataset_dir: /
+    basic_parameters:
+      dataset: native-lance-preencoded
+    preprocess_parameters: {}
+  dataloader_param:
+    dataloader_mode: sampler
+    sampler_type: BaseRandomBatchSampler
+    shuffle: ${LANCE_OVERFIT_SHUFFLE}
+    # BaseRandomBatchSampler currently requires drop_last=true.  Stage A/B
+    # therefore default to one data-parallel rank and one packed batch.
+    drop_last: true
+    pin_memory: true
+    num_workers: ${LANCE_NUM_WORKERS}
+    prefetch_factor: 2
+    persistent_workers: false
+    collate_param:
+      model_name: lance
+
+model:
+  model_id: lance
+  native_config_only: true
+  # Keep the initialization-DCP geometry even though these experiments are T2I.
+  variant: video
+  llm_config: ${LANCE_LLM_CONFIG}
+  native_config:
+    latent_patch_size:
+      - ${LANCE_LATENT_PATCH_T}
+      - ${LANCE_LATENT_PATCH_H}
+      - ${LANCE_LATENT_PATCH_W}
+    max_latent_size: ${LANCE_MAX_LATENT_SIZE}
+    max_num_frames: ${LANCE_MAX_NUM_FRAMES}
+  effective_vocab_size: ${LANCE_EFFECTIVE_VOCAB_SIZE}
+  gradient_checkpointing: ${LANCE_GRADIENT_CHECKPOINTING}
+  ce_weight: 0.0
+  mse_weight: 1.0
+  timestep_shift: 1.0
+  # Retain the connector so the parameter tree strictly matches the init DCP.
+  # Pure T2I sends it only an empty tensor, so it receives no effective update.
+  use_vit_connector: true
+  include_vit_model: false
+  freeze: []
+  use_ema: false
+  loss_cfg:
+    loss_type: raw
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: ${LANCE_GRADIENT_ACCUMULATION_STEPS}
+  seed: 2025
+  lr: ${LANCE_OVERFIT_LR}
+  lr_start: 0.0
+  lr_min: 1.0e-7
+  lr_decay_style: constant
+  lr_warmup_ratio: 0.0
+  lr_warmup_steps: ${LANCE_WARMUP_STEPS}
+  weight_decay: 0.0
+  train_iters: ${LANCE_TRAIN_ITERS}
+  train_tokens: 0
+  stop_after_iters: ${LANCE_STOP_AFTER_ITERS}
+  clip_grad: 1.0
+  optimizer: adamw
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-15
+  adam_fused: true
+  init_model_with_meta_device: true
+  load: ${LANCE_LOAD_DCP}
+  load_strict: true
+  no_load_optim: false
+  no_load_rng: false
+  # Diagnostic checkpoints are used for generation comparisons, not optimizer
+  # continuation.  Model-only saves avoid several GiB of Adam state per point.
+  no_save_optim: true
+  no_save_rng: true
+  log_interval: 1
+  trace_file: ${LANCE_TRACE_FILE}
+  save_interval: ${LANCE_SAVE_INTERVAL}
+  save_interval_tokens: 0
+  save: ${LANCE_OUTPUT_DIR}
+  save_async: false
+  use_deter_comp: false
+  plugin:
+    - mindspeed_mm/fsdp/models/lance
+    - mindspeed_mm/fsdp/data/datasets/lance
+
+tools:
+  profile:
+    enable: false
+  memory_profile:
+    enable: false

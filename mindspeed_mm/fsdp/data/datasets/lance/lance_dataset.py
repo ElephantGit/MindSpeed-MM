@@ -46,6 +46,8 @@ class LancePreencodedDataset(Dataset):
         root: str | None = None,
         *,
         resample_timesteps: bool = True,
+        fixed_noise_seed: int | None = None,
+        disable_posterior_sampling: bool = False,
     ) -> None:
         root_path = Path(root).expanduser().resolve() if root else None
         resolved = []
@@ -65,6 +67,10 @@ class LancePreencodedDataset(Dataset):
             raise ValueError("native Lance pre-encoded dataset is empty")
         self.files = tuple(resolved)
         self.resample_timesteps = bool(resample_timesteps)
+        self.fixed_noise_seed = (
+            None if fixed_noise_seed is None else int(fixed_noise_seed)
+        )
+        self.disable_posterior_sampling = bool(disable_posterior_sampling)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -79,6 +85,21 @@ class LancePreencodedDataset(Dataset):
         else:
             raise TypeError("{} does not contain a LanceTrainingBatch".format(self.files[index]))
         batch.resample_timesteps = self.resample_timesteps
+        if self.disable_posterior_sampling:
+            batch.latent_log_variance = None
+        if self.fixed_noise_seed is not None and batch.clean_latents is not None:
+            # Generate in FP32 on CPU for deterministic behavior across hosts,
+            # then cast to the stored latent dtype.  The index offset gives
+            # every packed batch a stable but distinct noise tensor.
+            generator = torch.Generator(device="cpu").manual_seed(
+                self.fixed_noise_seed + int(index)
+            )
+            batch.noise = torch.randn(
+                batch.clean_latents.shape,
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            ).to(dtype=batch.clean_latents.dtype)
         return {"lance_batch": batch, "batch_path": str(self.files[index])}
 
 
@@ -152,6 +173,10 @@ def build_lance_dataset(basic_param, preprocess_param, dataset_param=None):
         files,
         root=dataset_param.get("dataset_dir", basic.get("dataset_dir")),
         resample_timesteps=bool(dataset_param.get("resample_timesteps", True)),
+        fixed_noise_seed=dataset_param.get("fixed_noise_seed"),
+        disable_posterior_sampling=bool(
+            dataset_param.get("disable_posterior_sampling", False)
+        ),
     )
 
 

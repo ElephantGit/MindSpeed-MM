@@ -19,6 +19,7 @@ from mindspeed_mm.models.omni.lance.modeling_lance import LanceNativeModel
 from mindspeed_mm.models.omni.lance.native_config import LanceNativeConfig
 from mindspeed_mm.models.omni.lance.sequence import LancePackedSequence, LanceSegment
 from mindspeed_mm.models.omni.lance.training_lance import LanceLossWeights, lance_training_step
+from mindspeed_mm.fsdp.data.datasets.lance.lance_dataset import LancePreencodedDataset
 
 
 def _config():
@@ -103,6 +104,30 @@ def test_packed_batch_runs_joint_forward_backward():
     assert output["ce_loss"] is not None
     assert output["mse_loss"] is not None
     assert model.vae2llm.weight.grad is not None
+
+
+def test_preencoded_dataset_can_make_overfit_inputs_deterministic(tmp_path):
+    packed = pack_preencoded_samples(
+        (_samples()[1],), _config(), max_tokens=4, attention_backend="reference"
+    )
+    packed.batch.latent_log_variance = torch.zeros_like(packed.batch.clean_latents)
+    source_noise = packed.batch.noise.clone()
+    path = tmp_path / "batch.pt"
+    torch.save(packed.batch, path)
+
+    dataset = LancePreencodedDataset(
+        (str(path),),
+        resample_timesteps=False,
+        fixed_noise_seed=2025,
+        disable_posterior_sampling=True,
+    )
+    first = dataset[0]["lance_batch"]
+    second = dataset[0]["lance_batch"]
+
+    assert first.resample_timesteps is False
+    assert first.latent_log_variance is None
+    torch.testing.assert_close(first.noise, second.noise)
+    assert not torch.equal(first.noise, source_noise)
 
 
 def test_collator_rejects_token_overflow_and_incomplete_input_coverage():
