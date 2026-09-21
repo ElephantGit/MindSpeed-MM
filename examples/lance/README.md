@@ -213,6 +213,30 @@ bash scripts/inference_lance_native.sh
 prompt 和 seed 的 `lance_native_inference.json`。当前为了保持 prompt builder 的严格注意力语义，使用
 完整序列 sampler；KV-cache 需在目标 VAE token 调整为连续 sequence suffix 后再启用。
 
+### T2I overfit Stage A 精确单步重建
+
+Stage A 只监督固定图片、固定 CPU FP32 noise 和 `t=0.5` 组成的一个 flow-matching 点。普通 T2I
+推理从另一份 NPU noise 的 `t=1` 开始并遍历完整时间轨迹，不能用于判断这个单点是否拟合成功。
+使用下面的诊断入口复现训练时的 noise 和 packed batch，并直接计算
+`x0_hat = x_t - t * v_pred`：
+
+```bash
+bash examples/lance/config/train_local/run_lance_t2i_overfit_stage_a_reconstruction.sh
+```
+
+需要覆盖默认路径时使用环境变量：
+
+```bash
+CHECKPOINT=/mnt/models/outputs/lance-qwen3-06b-t2i-overfit-stage-a/iter_0000500 \
+PACKED_BATCH=/mnt/models/DATA_INIT/MULTI/T2I/Qwen3-0.6B-overfit-1-packed/batch-00000000.pt \
+OUTPUT_DIR=/mnt/models/outputs/lance-qwen3-06b-t2i-overfit-stage-a/eval-exact-training-point \
+bash examples/lance/config/train_local/run_lance_t2i_overfit_stage_a_reconstruction.sh
+```
+
+输出包括 `training_latent_target.png`、`stage_a_single_step_reconstruction.png` 和包含 velocity MSE、
+重建 latent MSE、decoded PSNR 的 `stage_a_single_step_reconstruction.json`。Stage A 默认保存普通模型
+权重且未启用 EMA，因此该脚本默认加载 model weights。
+
 ## 历史第一阶段：官方推理与评测基线
 
 本目录提供 Lance 官方 checkpoint 的零转换推理桥接和论文评测协议。第一阶段保留官方
