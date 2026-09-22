@@ -1,6 +1,8 @@
 """Native Lance flow-matching sampler and model-facing denoiser context."""
 
 from dataclasses import dataclass
+import math
+from statistics import NormalDist
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -109,12 +111,33 @@ def lance_sampling_schedule(
     timestep_shift: float,
     *,
     device=None,
+    schedule: str = "linear",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return shifted model timesteps and positive Euler step widths."""
 
     if num_steps <= 0:
         raise LanceSamplingError("num_steps must be positive")
-    base = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
+    if schedule == "linear":
+        base = torch.linspace(
+            1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32
+        )
+    elif schedule == "sigmoid_normal":
+        # Deterministic quantiles of t=sigmoid(N(0, 1)) align the internal
+        # model evaluations with the training density.  Exact endpoints remain
+        # mandatory because flow integration still starts at noise (t=1) and
+        # must finish at data (t=0).
+        normal = NormalDist()
+        internal = [
+            1.0 / (1.0 + math.exp(-normal.inv_cdf(index / num_steps)))
+            for index in range(num_steps - 1, 0, -1)
+        ]
+        base = torch.tensor(
+            [1.0, *internal, 0.0], device=device, dtype=torch.float32
+        )
+    else:
+        raise LanceSamplingError(
+            "schedule must be 'linear' or 'sigmoid_normal'"
+        )
     shifted = shift_timesteps(base, timestep_shift)
     return shifted[:-1], shifted[:-1] - shifted[1:]
 
@@ -376,6 +399,7 @@ def euler_flow_sample(
     *,
     num_steps: int,
     timestep_shift: float,
+    timestep_schedule: str = "linear",
     update_indexes: Optional[torch.Tensor] = None,
     cfg_interval: Tuple[float, float] = (0.0, 1.0),
     text_scale: float = 1.0,
@@ -396,6 +420,7 @@ def euler_flow_sample(
         num_steps,
         timestep_shift,
         device=initial_latents.device,
+        schedule=timestep_schedule,
     )
     for timestep, width in zip(timesteps, widths):
         conditional = velocity_function(latents, timestep, "conditional")
@@ -430,6 +455,7 @@ def sample_native_lance(
     *,
     num_steps: int,
     timestep_shift: float,
+    timestep_schedule: str = "linear",
     text_unconditional_context: Optional[LanceDenoiseContext] = None,
     vision_unconditional_context: Optional[LanceDenoiseContext] = None,
     cfg_interval: Tuple[float, float] = (0.0, 1.0),
@@ -457,6 +483,7 @@ def sample_native_lance(
         velocity,
         num_steps=num_steps,
         timestep_shift=timestep_shift,
+        timestep_schedule=timestep_schedule,
         update_indexes=context.prediction_latent_indexes,
         cfg_interval=cfg_interval,
         text_scale=text_scale,
@@ -473,6 +500,7 @@ def sample_native_lance_cached(
     *,
     num_steps: int,
     timestep_shift: float,
+    timestep_schedule: str = "linear",
     text_unconditional_context: Optional[LanceDenoiseContext] = None,
     vision_unconditional_context: Optional[LanceDenoiseContext] = None,
     cfg_interval: Tuple[float, float] = (0.0, 1.0),
@@ -514,6 +542,7 @@ def sample_native_lance_cached(
         velocity,
         num_steps=num_steps,
         timestep_shift=timestep_shift,
+        timestep_schedule=timestep_schedule,
         update_indexes=context.prediction_latent_indexes,
         cfg_interval=cfg_interval,
         text_scale=text_scale,

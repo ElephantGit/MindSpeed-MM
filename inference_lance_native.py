@@ -48,6 +48,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--fps", type=int, default=12)
     parser.add_argument("--num-steps", type=int, default=30)
     parser.add_argument("--timestep-shift", type=float, default=3.5)
+    parser.add_argument(
+        "--timestep-schedule",
+        choices=("linear", "sigmoid_normal"),
+        default="linear",
+        help="Euler grid; sigmoid_normal uses deterministic training-distribution quantiles",
+    )
     parser.add_argument("--cfg-text-scale", type=float, default=4.0)
     parser.add_argument("--cfg-start", type=float, default=0.4)
     parser.add_argument("--cfg-end", type=float, default=1.0)
@@ -241,6 +247,7 @@ def main(argv=None) -> int:
         "sampling": {
             "num_steps": args.num_steps,
             "timestep_shift": args.timestep_shift,
+            "timestep_schedule": args.timestep_schedule,
             "cfg_text_scale": args.cfg_text_scale,
             "cfg_interval": [args.cfg_start, args.cfg_end],
             "cfg_renorm_min": args.cfg_renorm_min,
@@ -336,6 +343,7 @@ def main(argv=None) -> int:
                 initial,
                 num_steps=args.num_steps,
                 timestep_shift=args.timestep_shift,
+                timestep_schedule=args.timestep_schedule,
                 text_unconditional_context=unconditional,
                 cfg_interval=(args.cfg_start, args.cfg_end),
                 text_scale=args.cfg_text_scale,

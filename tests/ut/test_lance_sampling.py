@@ -55,6 +55,21 @@ def test_sampling_schedule_matches_released_shift_and_integrates_unit_interval()
     torch.testing.assert_close(widths.sum(), torch.tensor(1.0))
 
 
+def test_sigmoid_normal_sampling_schedule_matches_training_quantiles():
+    timesteps, widths = lance_sampling_schedule(
+        4, 1.0, schedule="sigmoid_normal"
+    )
+    expected = torch.tensor([1.0, 0.6625, 0.5, 0.3375])
+    torch.testing.assert_close(timesteps, expected, atol=5e-5, rtol=0.0)
+    assert torch.all(widths > 0)
+    torch.testing.assert_close(widths.sum(), torch.tensor(1.0))
+
+
+def test_sampling_schedule_rejects_unknown_distribution():
+    with pytest.raises(LanceSamplingError, match="schedule"):
+        lance_sampling_schedule(4, 1.0, schedule="unknown")
+
+
 def test_euler_sampler_uses_noise_to_data_velocity_direction_and_subset_updates():
     initial = torch.ones(3, 2)
 

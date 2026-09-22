@@ -18,11 +18,12 @@ PROMPT_FILE="${PROMPT_FILE:-${EXAMPLE_DIR}/prompt.json}"
 TARGET_IMAGE="${TARGET_IMAGE:-${EXAMPLE_DIR}/training_target.png}"
 DEVICE="${DEVICE:-npu:0}"
 NUM_STEPS="${NUM_STEPS:-50}"
+TIMESTEP_SCHEDULE="${TIMESTEP_SCHEDULE:-linear}"
 WEIGHTS="${WEIGHTS:-model}"
 SEEDS="${SEEDS:-2025 2026 2027}"
 CHECKPOINT_NAME="$(basename "${CHECKPOINT}")"
 CHECKPOINT_ROOT="$(dirname "${CHECKPOINT}")"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${CHECKPOINT_ROOT}/eval-${CHECKPOINT_NAME}-${NUM_STEPS}step-${WEIGHTS}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${CHECKPOINT_ROOT}/eval-${CHECKPOINT_NAME}-${NUM_STEPS}step-${TIMESTEP_SCHEDULE}-${WEIGHTS}}"
 
 if [[ ! -f "${METADATA}" || ! -f "${PROMPT_FILE}" || ! -f "${TARGET_IMAGE}" ]]; then
   echo "Missing training-example metadata, prompt, or target under ${EXAMPLE_DIR}." >&2
@@ -54,6 +55,7 @@ for seed in ${SEEDS}; do
     --width "${WIDTH}"
     --num-steps "${NUM_STEPS}"
     --timestep-shift 1.0
+    --timestep-schedule "${TIMESTEP_SCHEDULE}"
     --cfg-text-scale 1.0
     --cfg-renorm-type none
     --seed "${seed}"
