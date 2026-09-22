@@ -13,6 +13,15 @@ REPO_ROOT="$(cd "${HERE}/../../../.." && pwd)"
 : "${LANCE_OVERFIT_DISABLE_POSTERIOR_SAMPLING:?stage launcher must set posterior policy}"
 : "${LANCE_OVERFIT_SHUFFLE:?stage launcher must set shuffle policy}"
 
+# Preserve historical Stage A/B/C behavior unless a diagnostic launcher
+# explicitly chooses a different timestep distribution or optimization policy.
+export LANCE_OVERFIT_TIMESTEP_SAMPLING="${LANCE_OVERFIT_TIMESTEP_SAMPLING:-sigmoid_normal}"
+export LANCE_OVERFIT_TIMESTEP_UNIFORM_PROBABILITY="${LANCE_OVERFIT_TIMESTEP_UNIFORM_PROBABILITY:-0.0}"
+export LANCE_OVERFIT_USE_EMA="${LANCE_OVERFIT_USE_EMA:-false}"
+export LANCE_OVERFIT_EMA_DECAY="${LANCE_OVERFIT_EMA_DECAY:-0.999}"
+export LANCE_OVERFIT_LR_MIN="${LANCE_OVERFIT_LR_MIN:-1.0e-7}"
+export LANCE_OVERFIT_LR_DECAY_STYLE="${LANCE_OVERFIT_LR_DECAY_STYLE:-constant}"
+
 export CONFIG_FILE="${CONFIG_FILE:-${HERE}/fsdp2_t2i_overfit_qwen3_06b.yaml}"
 export QWEN_PATH="${QWEN_PATH:-/mnt/models/MODELS/Qwen3-0.6B}"
 export LANCE_LOAD_DCP="${LANCE_LOAD_DCP:-/mnt/models/MODELS/lance-qwen3-06b-init-dcp}"
@@ -66,8 +75,8 @@ echo "T2I overfit stage: ${LANCE_OVERFIT_STAGE}"
 echo "Initialization: ${LANCE_LOAD_DCP}"
 echo "Packed data: ${LANCE_PREENCODED_DATA} (${packed_count} batches)"
 echo "Output: ${LANCE_OUTPUT_DIR}"
-echo "Randomness: resample_t=${LANCE_OVERFIT_RESAMPLE_TIMESTEPS}, fixed_noise=${LANCE_OVERFIT_FIXED_NOISE_SEED}, disable_posterior=${LANCE_OVERFIT_DISABLE_POSTERIOR_SAMPLING}"
-echo "Optimization: iters=${LANCE_TRAIN_ITERS}, warmup=${LANCE_WARMUP_STEPS}, lr=${LANCE_OVERFIT_LR}"
+echo "Randomness: resample_t=${LANCE_OVERFIT_RESAMPLE_TIMESTEPS}, timestep_sampling=${LANCE_OVERFIT_TIMESTEP_SAMPLING}, uniform_probability=${LANCE_OVERFIT_TIMESTEP_UNIFORM_PROBABILITY}, fixed_noise=${LANCE_OVERFIT_FIXED_NOISE_SEED}, disable_posterior=${LANCE_OVERFIT_DISABLE_POSTERIOR_SAMPLING}"
+echo "Optimization: iters=${LANCE_TRAIN_ITERS}, warmup=${LANCE_WARMUP_STEPS}, lr=${LANCE_OVERFIT_LR}, schedule=${LANCE_OVERFIT_LR_DECAY_STYLE}, lr_min=${LANCE_OVERFIT_LR_MIN}, ema=${LANCE_OVERFIT_USE_EMA}"
 
 cd "${REPO_ROOT}"
 exec bash scripts/pretrain_lance_native.sh "$@"

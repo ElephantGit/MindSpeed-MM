@@ -57,6 +57,10 @@ class LanceTrainingBatch:
     # Pre-encoded datasets store target/condition sentinels and request fresh
     # per-visual timesteps from the accelerator RNG at each training visit.
     resample_timesteps: bool = False
+    # Keep the released sigmoid-normal policy as the default while allowing
+    # focused diagnostics to increase coverage near t=0 and t=1.
+    timestep_sampling: str = "sigmoid_normal"
+    timestep_uniform_probability: float = 0.0
 
     @property
     def sequence_length(self) -> int:
@@ -153,6 +157,9 @@ class LanceTrainingBatch:
         if self.ce_indexes is not None and self.mse_indexes is not None:
             if set(self.ce_indexes.tolist()) & set(self.mse_indexes.tolist()):
                 raise LanceTrainingError("CE and MSE indexes must not overlap")
+        _validate_timestep_sampling(
+            self.timestep_sampling, self.timestep_uniform_probability
+        )
 
 
 def _validate_indexes(name: str, indexes: torch.Tensor, length: int) -> None:
@@ -176,8 +183,30 @@ def shift_timesteps(
     return shift * timesteps / (1.0 + (shift - 1.0) * timesteps)
 
 
+def _validate_timestep_sampling(mode: str, uniform_probability: float) -> None:
+    if mode not in ("sigmoid_normal", "uniform", "mixture"):
+        raise LanceTrainingError(
+            "timestep_sampling must be 'sigmoid_normal', 'uniform', or 'mixture'"
+        )
+    if not 0.0 <= uniform_probability <= 1.0:
+        raise LanceTrainingError("timestep_uniform_probability must be in [0, 1]")
+    if mode != "mixture" and uniform_probability != 0.0:
+        raise LanceTrainingError(
+            "timestep_uniform_probability is only used by mixture sampling"
+        )
+
+
 def _resampled_timesteps(batch: LanceTrainingBatch) -> torch.Tensor:
-    """Sample one sigmoid-normal value for each contiguous target visual span."""
+    """Sample one timestep for each contiguous target visual span.
+
+    ``sigmoid_normal`` preserves the released Lance behavior.  ``uniform`` is
+    useful for testing endpoint under-training, while ``mixture`` combines the
+    original density around t=0.5 with explicit coverage of both tails.
+    """
+
+    _validate_timestep_sampling(
+        batch.timestep_sampling, batch.timestep_uniform_probability
+    )
 
     result = torch.zeros_like(batch.timesteps)
     if batch.mse_indexes is None or not batch.mse_indexes.numel():
@@ -192,9 +221,23 @@ def _resampled_timesteps(batch: LanceTrainingBatch) -> torch.Tensor:
     starts = selected & ~previous_contiguous
     group_ids = starts.long().cumsum(0) - 1
     group_count = int(starts.sum().item())
-    values = torch.sigmoid(
-        torch.randn(group_count, device=result.device, dtype=torch.float32)
-    ).to(result.dtype)
+    if batch.timestep_sampling == "uniform":
+        values = torch.rand(
+            group_count, device=result.device, dtype=torch.float32
+        )
+    else:
+        values = torch.sigmoid(
+            torch.randn(group_count, device=result.device, dtype=torch.float32)
+        )
+        if batch.timestep_sampling == "mixture":
+            use_uniform = torch.rand(
+                group_count, device=result.device, dtype=torch.float32
+            ) < batch.timestep_uniform_probability
+            uniform_values = torch.rand(
+                group_count, device=result.device, dtype=torch.float32
+            )
+            values = torch.where(use_uniform, uniform_values, values)
+    values = values.to(result.dtype)
     result[selected] = values[group_ids[selected]]
     return result
 

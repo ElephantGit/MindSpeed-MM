@@ -46,6 +46,8 @@ class LancePreencodedDataset(Dataset):
         root: str | None = None,
         *,
         resample_timesteps: bool = True,
+        timestep_sampling: str = "sigmoid_normal",
+        timestep_uniform_probability: float = 0.0,
         fixed_noise_seed: int | None = None,
         disable_posterior_sampling: bool = False,
     ) -> None:
@@ -67,6 +69,21 @@ class LancePreencodedDataset(Dataset):
             raise ValueError("native Lance pre-encoded dataset is empty")
         self.files = tuple(resolved)
         self.resample_timesteps = bool(resample_timesteps)
+        self.timestep_sampling = str(timestep_sampling)
+        self.timestep_uniform_probability = float(timestep_uniform_probability)
+        if self.timestep_sampling not in ("sigmoid_normal", "uniform", "mixture"):
+            raise ValueError(
+                "timestep_sampling must be 'sigmoid_normal', 'uniform', or 'mixture'"
+            )
+        if not 0.0 <= self.timestep_uniform_probability <= 1.0:
+            raise ValueError("timestep_uniform_probability must be in [0, 1]")
+        if (
+            self.timestep_sampling != "mixture"
+            and self.timestep_uniform_probability != 0.0
+        ):
+            raise ValueError(
+                "timestep_uniform_probability is only used by mixture sampling"
+            )
         self.fixed_noise_seed = (
             None if fixed_noise_seed is None else int(fixed_noise_seed)
         )
@@ -85,6 +102,8 @@ class LancePreencodedDataset(Dataset):
         else:
             raise TypeError("{} does not contain a LanceTrainingBatch".format(self.files[index]))
         batch.resample_timesteps = self.resample_timesteps
+        batch.timestep_sampling = self.timestep_sampling
+        batch.timestep_uniform_probability = self.timestep_uniform_probability
         if self.disable_posterior_sampling:
             batch.latent_log_variance = None
         if self.fixed_noise_seed is not None and batch.clean_latents is not None:
@@ -173,6 +192,12 @@ def build_lance_dataset(basic_param, preprocess_param, dataset_param=None):
         files,
         root=dataset_param.get("dataset_dir", basic.get("dataset_dir")),
         resample_timesteps=bool(dataset_param.get("resample_timesteps", True)),
+        timestep_sampling=str(
+            dataset_param.get("timestep_sampling", "sigmoid_normal")
+        ),
+        timestep_uniform_probability=float(
+            dataset_param.get("timestep_uniform_probability", 0.0)
+        ),
         fixed_noise_seed=dataset_param.get("fixed_noise_seed"),
         disable_posterior_sampling=bool(
             dataset_param.get("disable_posterior_sampling", False)

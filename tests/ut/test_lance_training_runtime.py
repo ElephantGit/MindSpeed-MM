@@ -177,3 +177,27 @@ def test_runtime_timestep_sampling_groups_contiguous_target_visuals():
     assert values[0] == values[1]
     assert values[2] == 0
     assert 0 < values[3] < 1
+
+
+@pytest.mark.parametrize("mode", ("sigmoid_normal", "uniform", "mixture"))
+def test_runtime_timestep_sampling_supports_configured_distributions(mode):
+    batch = _training_batch(_config())
+    batch.timestep_sampling = mode
+    batch.timestep_uniform_probability = 0.5 if mode == "mixture" else 0.0
+    torch.manual_seed(11)
+    values = _resampled_timesteps(batch)
+    assert torch.all(values >= 0)
+    assert torch.all(values < 1)
+    assert values[0] == values[1]
+
+
+@pytest.mark.parametrize(
+    ("mode", "probability"),
+    (("unknown", 0.0), ("uniform", 0.5), ("mixture", -0.1), ("mixture", 1.1)),
+)
+def test_runtime_timestep_sampling_rejects_invalid_configuration(mode, probability):
+    batch = _training_batch(_config())
+    batch.timestep_sampling = mode
+    batch.timestep_uniform_probability = probability
+    with pytest.raises(ValueError):
+        _resampled_timesteps(batch)

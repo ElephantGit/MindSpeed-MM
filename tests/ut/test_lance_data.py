@@ -118,6 +118,8 @@ def test_preencoded_dataset_can_make_overfit_inputs_deterministic(tmp_path):
     dataset = LancePreencodedDataset(
         (str(path),),
         resample_timesteps=False,
+        timestep_sampling="mixture",
+        timestep_uniform_probability=0.5,
         fixed_noise_seed=2025,
         disable_posterior_sampling=True,
     )
@@ -125,6 +127,8 @@ def test_preencoded_dataset_can_make_overfit_inputs_deterministic(tmp_path):
     second = dataset[0]["lance_batch"]
 
     assert first.resample_timesteps is False
+    assert first.timestep_sampling == "mixture"
+    assert first.timestep_uniform_probability == pytest.approx(0.5)
     assert first.latent_log_variance is None
     torch.testing.assert_close(first.noise, second.noise)
     assert not torch.equal(first.noise, source_noise)

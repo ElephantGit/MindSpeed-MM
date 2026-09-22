@@ -30,6 +30,8 @@ data:
     files:
       - ${LANCE_PREENCODED_DATA}
     resample_timesteps: ${LANCE_OVERFIT_RESAMPLE_TIMESTEPS}
+    timestep_sampling: ${LANCE_OVERFIT_TIMESTEP_SAMPLING}
+    timestep_uniform_probability: ${LANCE_OVERFIT_TIMESTEP_UNIFORM_PROBABILITY}
     # An integer makes noise a deterministic function of packed-batch index;
     # YAML null preserves normal per-visit random noise.
     fixed_noise_seed: ${LANCE_OVERFIT_FIXED_NOISE_SEED}
@@ -76,7 +78,8 @@ model:
   use_vit_connector: true
   include_vit_model: false
   freeze: []
-  use_ema: false
+  use_ema: ${LANCE_OVERFIT_USE_EMA}
+  ema_decay: ${LANCE_OVERFIT_EMA_DECAY}
   loss_cfg:
     loss_type: raw
 
@@ -86,8 +89,8 @@ training:
   seed: 2025
   lr: ${LANCE_OVERFIT_LR}
   lr_start: 0.0
-  lr_min: 1.0e-7
-  lr_decay_style: constant
+  lr_min: ${LANCE_OVERFIT_LR_MIN}
+  lr_decay_style: ${LANCE_OVERFIT_LR_DECAY_STYLE}
   lr_warmup_ratio: 0.0
   lr_warmup_steps: ${LANCE_WARMUP_STEPS}
   weight_decay: 0.0
