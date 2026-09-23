@@ -70,8 +70,11 @@ model:
     max_num_frames: ${LANCE_MAX_NUM_FRAMES}
   effective_vocab_size: ${LANCE_EFFECTIVE_VOCAB_SIZE}
   gradient_checkpointing: ${LANCE_GRADIENT_CHECKPOINTING}
-  ce_weight: 0.0
-  mse_weight: 1.0
+  # Pure-T2I launchers retain 0:1 through defaults in the common launcher.
+  # The paired T2I+I2T launcher uses 1:1 so a single-task packed step keeps
+  # the same gradient scale as its corresponding single-task baseline.
+  ce_weight: ${LANCE_OVERFIT_CE_WEIGHT}
+  mse_weight: ${LANCE_OVERFIT_MSE_WEIGHT}
   timestep_shift: 1.0
   # Retain the connector so the parameter tree strictly matches the init DCP.
   # Pure T2I sends it only an empty tensor, so it receives no effective update.
