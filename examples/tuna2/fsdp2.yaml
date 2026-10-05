@@ -1,0 +1,12 @@
+sharding_size: auto
+sub_modules_to_wrap:
+  - "model.tuna_model.tuna.model.layers.{*}"
+  - "model.tuna_model.diffusion_head_a.{*}"
+param_dtype: bf16
+reduce_dtype: fp32
+cast_forward_inputs: False
+ignored_modules: []
+recompute_modules: []
+num_to_forward_prefetch: 0
+num_to_backward_prefetch: 0
+offload_to_cpu: False

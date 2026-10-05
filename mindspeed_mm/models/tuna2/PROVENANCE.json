@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/facebookresearch/tuna-2",
+  "commit": "b53594e308095b573c31be46f24ea62936f3c440",
+  "license": "Apache-2.0",
+  "changes": [
+    "Namespace imports relocated to mindspeed_mm.models.tuna2.upstream",
+    "Device-neutral dispersive loss",
+    "Config-only LLM initialization option",
+    "Dynamic patch size and diffusion attention head dimension for RoPE",
+    "Empty generation masks return differentiable zero",
+    "Pixel-only collator removes fallback images_clip"
+  ]
+}

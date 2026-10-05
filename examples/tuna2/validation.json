@@ -1,0 +1,120 @@
+{
+  "initial": {
+    "device": "cpu",
+    "steps": 8,
+    "world_size": 1,
+    "parameters": 329344,
+    "updated_parameters": 66,
+    "records": [
+      {
+        "step": 1,
+        "stream": "t2i",
+        "grad_norm": 0.5148231387138367,
+        "loss": 1.5231010913848877,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.5231010913848877
+      },
+      {
+        "step": 2,
+        "stream": "edit",
+        "grad_norm": 0.36311620473861694,
+        "loss": 1.3015036582946777,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.3015036582946777
+      },
+      {
+        "step": 3,
+        "stream": "mmu",
+        "grad_norm": 4.547985076904297,
+        "loss": 3.1165595054626465,
+        "loss_ntp": 3.1165595054626465,
+        "loss_flow": 0.0
+      },
+      {
+        "step": 4,
+        "stream": "text",
+        "grad_norm": 5.105496883392334,
+        "loss": 3.0449376106262207,
+        "loss_ntp": 3.0449376106262207,
+        "loss_flow": 0.0
+      },
+      {
+        "step": 5,
+        "stream": "t2i",
+        "grad_norm": 0.44238364696502686,
+        "loss": 1.3803211450576782,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.3803211450576782
+      },
+      {
+        "step": 6,
+        "stream": "edit",
+        "grad_norm": 0.41772741079330444,
+        "loss": 1.1776444911956787,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.1776444911956787
+      },
+      {
+        "step": 7,
+        "stream": "mmu",
+        "grad_norm": 4.695127487182617,
+        "loss": 3.0126025676727295,
+        "loss_ntp": 3.0126025676727295,
+        "loss_flow": 0.0
+      },
+      {
+        "step": 8,
+        "stream": "text",
+        "grad_norm": 5.13387393951416,
+        "loss": 2.9392664432525635,
+        "loss_ntp": 2.9392664432525635,
+        "loss_flow": 0.0
+      }
+    ]
+  },
+  "resumed": {
+    "device": "cpu",
+    "steps": 12,
+    "world_size": 1,
+    "parameters": 329344,
+    "updated_parameters": 66,
+    "records": [
+      {
+        "step": 9,
+        "stream": "t2i",
+        "grad_norm": 0.6424359083175659,
+        "loss": 1.7494218349456787,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.7494218349456787
+      },
+      {
+        "step": 10,
+        "stream": "edit",
+        "grad_norm": 0.741997241973877,
+        "loss": 1.946627140045166,
+        "loss_ntp": 0.0,
+        "loss_flow": 1.946627140045166
+      },
+      {
+        "step": 11,
+        "stream": "mmu",
+        "grad_norm": 3.9552714824676514,
+        "loss": 2.7749087810516357,
+        "loss_ntp": 2.7749087810516357,
+        "loss_flow": 0.0
+      },
+      {
+        "step": 12,
+        "stream": "text",
+        "grad_norm": 4.274023532867432,
+        "loss": 2.790681838989258,
+        "loss_ntp": 2.790681838989258,
+        "loss_flow": 0.0
+      }
+    ]
+  },
+  "resume_equal_continuous": true,
+  "torch": "2.10.0+cpu",
+  "tests": "3 passed",
+  "npu_validated": false
+}

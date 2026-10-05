@@ -168,3 +168,6 @@ cache_dir/
 /docker/torch_wheels/
 /docker/decord_deps/
 /docker/downloads/
+
+# Tuna-2 generated fixtures and checkpoints
+/outputs/tuna2*/
